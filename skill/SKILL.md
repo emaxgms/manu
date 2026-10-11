@@ -43,6 +43,12 @@ budget, escalation) is core Hermes, reused untouched.
   recitation; work them explicitly with `hermes kanban list` / `show <id>`.
 - **Kill switches:** `hermes plugins disable manu` (whole layer) · `hermes kanban archive <id>` (stops
   the recitation for that session).
+- **Specifier / decomposer aux model:** pin a provider that accepts plain auxiliary calls.
+  `opencode-go` returns HTTP 400 for aux requests on this machine (the endpoint wants an
+  `x-opencode-session` header the aux client does not send), so the specifier fails with
+  `LLM error: BadRequestError`. Verified working:
+  `hermes config set auxiliary.triage_specifier.provider openrouter` +
+  `... .model deepseek/deepseek-v4.1-flash` (repeat for `auxiliary.kanban_decomposer`).
 - **Ceiling, stated:** the gate is a presence check on evidence — quality is the reviewer's job. A human
   running `hermes kanban complete` in their own shell bypasses it on purpose.
 
@@ -60,9 +66,12 @@ Two loop exits, and the failure kind picks which:
 - ↻ **Retry** (inside Do, `running`): a machine-falsifiable failure (red test, crashing command, wrong
   output) is retried by the executor with **no human input**, up to `kanban.failure_limit` (2). At the
   threshold the card auto-blocks with a `gave_up` event.
-- ↻ **Rework** (back to Plan): green but not the requirement. Then **questions are allowed** —
-  `hermes kanban request-changes <id> --reason "<requirement not met>"` hands the card back to the
-  implementer with the reason attached. Three blind retries reproduce the same misreading three times.
+- ↻ **Rework** (back to Plan): green but not the requirement. Then **questions are allowed**. In-session
+  the exit is `hermes kanban reopen-review <id> --reason "<requirement not met>"` — verified: `review`
+  → `ready` with the reason recorded as a `CHANGES REQUESTED` comment. The reviewer-side
+  `hermes kanban request-changes <id> <reason...>` (reason is positional) only works on an **active
+  review run**, i.e. when a dispatcher/worker claimed the card for review; with dispatch off it answers
+  "task is not in an active review run". Three blind retries reproduce the same misreading three times.
 
 ## Failure triage — classify before retrying
 
@@ -98,7 +107,8 @@ hermes kanban claim <id>                 # Do (in-session: just work it; claim i
 hermes kanban request-review <id> --summary "what was built + what was verified"
 hermes kanban complete <id> --result "pytest -q -> 12 passed; report at /home/ema/report.md"
 hermes kanban attach <id> <file>         # evidence alternative to --result
-hermes kanban request-changes <id> --reason "acceptance #2 not met: no latency numbers"
+hermes kanban reopen-review <id> --reason "acceptance #2 not met: no latency numbers"   # rework, in-session
+hermes kanban request-changes <id> "acceptance #2 not met"   # reviewer-side; needs an active review run
 hermes kanban show <id> ; hermes kanban stats
 ```
 
@@ -137,3 +147,9 @@ attachment, and says so in the block message.
 
 - `references/kanban-capabilities.md` — verified command/flag/API map (`file:line` sources) for every
   kanban knob: statuses, `--completion-contract`, retry budget, block kinds, decompose/specify, hooks.
+
+**Pilot status (2026-10-11, this machine):** verified end to end — a fresh session with an open card
+gets exactly one `[manu]` line, a session with no open card gets none, both close paths are refused
+without evidence, `specify` promotes `triage → todo → ready`, `reopen-review --reason` records the
+reason and re-opens the card, and a PR card with `--completion-contract` refuses to close
+(`pr_acceptance` receipt `ok: false, classification: missing`).

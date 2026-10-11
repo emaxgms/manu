@@ -14,7 +14,8 @@ plugin adds only what Hermes does not already do:
 - **Phase bookkeeping** — mirrors the phase into the native `current_step_key` column on kanban
   lifecycle events (inert until the dispatcher runs; informational only).
 
-Everything else — dispatch, review, rework handoff (`request-changes --reason`), PR CI contracts
+Everything else — dispatch, review, rework handoff (`reopen-review --reason` in-session,
+`request-changes` when a review run is active), PR CI contracts
 (`--completion-contract`), the retry budget and auto-block, escalation back to `triage` — is core
 Hermes and is reused untouched.
 

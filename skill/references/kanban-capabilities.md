@@ -12,7 +12,8 @@ Everything here was verified against the installed tree at `~/.hermes/hermes-age
 - `todo` — waiting on parents; the dispatcher promotes `todo → ready` when every parent is `done`
   (`hermes kanban promote` forces it).
 - `ready` — claimable. `claim_task` requires `status='ready'` and `assignee IS NOT NULL`.
-- `review` — Check phase; `request-changes` hands it back, `reopen-review` returns it to `ready`/`todo`.
+- `review` — Check phase; `reopen-review --reason` returns it to `ready`/`todo` (the in-session rework
+  exit); `request-changes <id> <reason...>` is reviewer-side and requires an active review run.
 - `blocked` — the human bucket. `scheduled` — recurring work.
 
 ## Create / link / close
@@ -26,8 +27,8 @@ hermes kanban link <parent> <child>        # dependency edge (a running child is
 hermes kanban claim <id>                   # atomic; prints the resolved workspace path
 hermes kanban complete <id> --result "..." [--summary "..."] [--metadata '{...}']
 hermes kanban request-review <id> --summary "what was implemented and how it was verified" [--reviewer <profile>]
-hermes kanban request-changes <id> --reason "<requirement not met>"   # reason is REQUIRED
-hermes kanban reopen-review <id>
+hermes kanban request-changes <id> "<requirement not met>"   # reviewer-side; needs an ACTIVE review run
+hermes kanban reopen-review <id> [--reason "<...>"]          # rework in-session: review -> ready/todo
 hermes kanban block <id> --reason "..."   # kinds: dependency | needs_input | capability | transient
 hermes kanban promote <id> ; hermes kanban archive <id> ; hermes kanban stats
 ```
