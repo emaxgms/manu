@@ -1,0 +1,15 @@
+name: manu
+version: 0.1.0
+description: >-
+  Four-phase process layer (Plan / Do / Check / Close) over the Hermes kanban
+  board, with a rework loop back to Plan. Recites the current phase once per
+  turn while a card is open, and refuses to close a card that has no evidence.
+author: emaxgms
+license: MIT
+homepage: https://github.com/emaxgms/manu
+tags: [kanban, process, workflow, quality-gate]
+provides_hooks:
+  - pre_llm_call
+  - pre_tool_call
+  - kanban_task_claimed
+  - kanban_task_completed
