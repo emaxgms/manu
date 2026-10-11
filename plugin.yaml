@@ -8,6 +8,8 @@ author: emaxgms
 license: MIT
 homepage: https://github.com/emaxgms/manu
 tags: [kanban, process, workflow, quality-gate]
+provides_tools:
+  - manu_specify
 provides_hooks:
   - pre_llm_call
   - pre_tool_call

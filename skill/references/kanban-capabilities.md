@@ -8,7 +8,9 @@ Everything here was verified against the installed tree at `~/.hermes/hermes-age
 `VALID_STATUSES = {triage, todo, scheduled, ready, running, blocked, review, done, archived}`
 (`hermes_cli/kanban_db.py:89`). `VALID_INITIAL_STATUSES = {running, blocked}`.
 
-- `triage` — parking column for rough ideas; `specify` (or `decompose`) promotes it.
+- `triage` — parking column for rough ideas; `specify` (or `decompose`) promotes it. Run `specify`
+  through the `manu_specify` tool: the `hermes kanban specify` CLI has no turn context, so the
+  OpenCode relay rejects its aux call with 400 `MissingSessionID`.
 - `todo` — waiting on parents; the dispatcher promotes `todo → ready` when every parent is `done`
   (`hermes kanban promote` forces it).
 - `ready` — claimable. `claim_task` requires `status='ready'` and `assignee IS NOT NULL`.

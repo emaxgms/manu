@@ -127,6 +127,57 @@ def test_evidence_reads_real_db(tmp_path):
     assert manu._evidence("1", db=_fake_db(tmp_path / "c", result="done")) is True
 
 
+# --- specify tool (Plan step without the CLI) -----------------------------
+
+
+def test_specify_requires_task_id():
+    r = manu.specify("")
+    assert r["success"] is False and "task_id" in r["error"]
+
+
+def test_specify_maps_the_outcome(monkeypatch):
+    import types
+    import sys
+
+    fake = types.ModuleType("hermes_cli.kanban_specify")
+
+    class _Outcome:
+        ok = True
+        task_id = "t_1"
+        reason = "specified"
+        new_title = "Retitled"
+
+    fake.specify_task = lambda tid: _Outcome()
+    monkeypatch.setitem(sys.modules, "hermes_cli.kanban_specify", fake)
+    assert manu.specify("t_1") == {
+        "success": True, "task_id": "t_1", "reason": "specified", "new_title": "Retitled",
+    }
+
+
+def test_specify_survives_an_import_error(monkeypatch):
+    import sys
+
+    monkeypatch.setitem(sys.modules, "hermes_cli.kanban_specify", None)
+    r = manu.specify("t_1")
+    assert r["success"] is False and "error" in r
+
+
+def test_register_wires_hooks_and_tool():
+    seen = {"hooks": [], "tools": []}
+
+    class _Ctx:
+        def register_hook(self, name, cb):
+            seen["hooks"].append(name)
+
+        def register_tool(self, **kw):
+            seen["tools"].append(kw["name"])
+
+    manu.register(_Ctx())
+    assert seen["hooks"] == ["pre_llm_call", "pre_tool_call",
+                             "kanban_task_claimed", "kanban_task_completed"], seen
+    assert seen["tools"] == ["manu_specify"], seen
+
+
 # --- phase map ------------------------------------------------------------
 
 

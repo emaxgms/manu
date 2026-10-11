@@ -35,20 +35,23 @@ budget, escalation) is core Hermes, reused untouched.
 | Plugin | `~/.hermes/plugins/manu/{plugin.yaml,__init__.py}` | `pre_llm_call` recitation, `pre_tool_call` evidence gate, `kanban_task_claimed`/`_completed` step bookkeeping |
 | Recitation | injected into the current turn's user message | one line, **only** while a card whose `session_id` is this session is open; nothing when idle |
 | Gate | `pre_tool_call` | blocks `kanban_complete` (workers) **and** `hermes kanban complete` typed by the agent |
+| `manu_specify` tool | registered by the plugin (`toolset: manu`) | runs the aux specifier **in-process** → Plan artifact on the card, then promotes it out of `triage` |
 | Step mirror | `current_step_key` | informational; v1 routing ignores it. Inert while `kanban.dispatch_in_gateway: false` (those hooks fire in dispatcher/worker processes) |
-| Tests | `~/.hermes/hermes-agent/venv/bin/python -m pytest ~/.hermes/plugins/manu/test_manu.py -q` | 11 tests: recitation, gate on both paths, evidence lookup |
+| Tests | `~/.hermes/hermes-agent/venv/bin/python -m pytest ~/.hermes/plugins/manu/test_manu.py -q` | 17 tests: recitation, gate on both paths, evidence lookup, `manu_specify` mapping, hook/tool wiring |
 
 - **Card ↔ session binding:** a card created from a session inherits `HERMES_SESSION_ID`, and only then
   is it recited. Cards created from the dashboard or a plain shell have `session_id = NULL` → no
   recitation; work them explicitly with `hermes kanban list` / `show <id>`.
 - **Kill switches:** `hermes plugins disable manu` (whole layer) · `hermes kanban archive <id>` (stops
   the recitation for that session).
-- **Specifier / decomposer aux model:** pin a provider that accepts plain auxiliary calls.
-  `opencode-go` returns HTTP 400 for aux requests on this machine (the endpoint wants an
-  `x-opencode-session` header the aux client does not send), so the specifier fails with
-  `LLM error: BadRequestError`. Verified working:
-  `hermes config set auxiliary.triage_specifier.provider openrouter` +
-  `... .model deepseek/deepseek-v4.1-flash` (repeat for `auxiliary.kanban_decomposer`).
+- **Plan step = the `manu_specify` tool, never the `hermes kanban specify` CLI.** The relay header
+  `x-opencode-session` is derived from the **turn's** conversation context
+  (`agent/opencode_affinity.py` ← `agent/auxiliary_client.py:6018`; the context is set at
+  `agent/turn_context.py:383`). A standalone CLI process has no turn → no header → the OpenCode relay
+  answers `400 MissingSessionID` (`LLM error: BadRequestError`) with the **default** aux model, so no
+  provider pin fixes it. The tool calls the same specifier
+  (`hermes_cli.kanban_specify.specify_task`) inside the live turn, so the default model works and
+  `auxiliary.triage_specifier.*` stays at `auto`.
 - **Ceiling, stated:** the gate is a presence check on evidence — quality is the reviewer's job. A human
   running `hermes kanban complete` in their own shell bypasses it on purpose.
 
@@ -87,9 +90,9 @@ answers). Nothing to configure; classify honestly and spend the retry budget onl
 ## Recipes
 
 ```bash
-# 🟡 vague request: park it, let the specifier write the Plan artifact
+# 🟡 vague request: park it, then let the specifier write the Plan artifact
 hermes kanban create "improve the site" --triage --assignee default
-hermes kanban specify <id>              # triage -> todo, Goal/Approach/Acceptance criteria/Out of scope
+#   -> call the manu_specify TOOL with that id (not the CLI: outside a turn it 400s, see Mechanics)
 hermes kanban show <id>                 # read Acceptance criteria BEFORE building
 
 # 🟡 concrete request: write the body yourself, start in todo

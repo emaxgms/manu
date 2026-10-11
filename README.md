@@ -13,6 +13,11 @@ plugin adds only what Hermes does not already do:
   the agent (in-session work).
 - **Phase bookkeeping** — mirrors the phase into the native `current_step_key` column on kanban
   lifecycle events (inert until the dispatcher runs; informational only).
+- **`manu_specify` tool** — runs the auxiliary specifier *in-process* for a `triage` card (Goal /
+  Approach / Acceptance criteria / Out of scope, then promotes it out of triage). The CLI
+  `hermes kanban specify` runs in its own process with no conversation context, so a relay provider
+  that needs a session header (OpenCode) answers HTTP 400 `MissingSessionID`; the tool has the live
+  turn's context, so the **default** aux model works with no config override.
 
 Everything else — dispatch, review, rework handoff (`reopen-review --reason` in-session,
 `request-changes` when a review run is active), PR CI contracts

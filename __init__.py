@@ -17,6 +17,7 @@ budget, escalation back to triage — is core Hermes and is reused untouched.
 
 from __future__ import annotations
 
+import json
 import re
 import shlex
 import sqlite3
@@ -219,6 +220,54 @@ def _recite_hook(session_id: Optional[str] = None, **kwargs) -> Optional[dict]:
     return {"context": line} if line else None
 
 
+_SPECIFY_SCHEMA = {
+    "name": "manu_specify",
+    "description": (
+        "Plan step for a vague card: ask the auxiliary specifier for Goal / Approach / Acceptance "
+        "criteria / Out of scope, retitle the card and promote it out of `triage`. Returns JSON. "
+        "Use this instead of the `hermes kanban specify` CLI: that command runs in its own process "
+        "with no conversation context, so a relay provider that needs a session header (OpenCode) "
+        "answers HTTP 400 MissingSessionID. This runs the same specifier in-process."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": "Card id of a card in `triage` (from `hermes kanban list`).",
+            }
+        },
+        "required": ["task_id"],
+    },
+}
+
+
+def specify(task_id: str) -> dict:
+    """Run the auxiliary specifier in this process and promote the card.
+
+    Returns a dict, never raises: the caller is a tool handler.
+    """
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        return {"success": False, "error": "task_id is required"}
+    try:
+        from hermes_cli.kanban_specify import specify_task
+
+        outcome = specify_task(task_id)
+    except Exception as exc:
+        return {"success": False, "task_id": task_id, "error": f"{type(exc).__name__}: {exc}"}
+    return {
+        "success": bool(outcome.ok),
+        "task_id": outcome.task_id,
+        "reason": outcome.reason,
+        "new_title": outcome.new_title,
+    }
+
+
+def _specify_handler(args: dict, **kwargs) -> str:
+    return json.dumps(specify((args or {}).get("task_id")))
+
+
 def _on_claimed(task_id: Optional[str] = None, board: Optional[str] = None, **kwargs) -> None:
     _set_step(task_id, "Do", board=board)
 
@@ -232,3 +281,10 @@ def register(ctx: Any) -> None:
     ctx.register_hook("pre_tool_call", gate)
     ctx.register_hook("kanban_task_claimed", _on_claimed)
     ctx.register_hook("kanban_task_completed", _on_completed)
+    ctx.register_tool(
+        name="manu_specify",
+        toolset="manu",
+        schema=_SPECIFY_SCHEMA,
+        handler=_specify_handler,
+        description="Specify a triage card in-process (Plan phase)",
+    )
