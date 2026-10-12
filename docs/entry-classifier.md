@@ -18,7 +18,8 @@ traffic and publish the numbers.
    are the dangerous ones — real work that never gets a card.
 
 The corpus itself stays outside this repository (it is the user's own chat log). The run recorded below
-covered **45 requests, 2026-09-30 → 2026-10-12**, labelled by the agent and kept as
+covered **45 requests, 2026-10-10 → 2026-10-12** (31 from a telegram session, 14 from the desktop UI),
+labelled by the agent and kept as
 `~/.hermes/plans/manu-classifier-corpus.json` with the full table in
 `~/.hermes/plans/manu-classifier-measurement.md`.
 

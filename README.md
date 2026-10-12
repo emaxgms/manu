@@ -86,6 +86,14 @@ A verdict that comes back truncated or malformed is **refused, not recorded**: t
 `success=false` with the raw reply and leaves the card in Do, because a Check the gate accepts but nobody
 can read is worse than no Check at all.
 
+**Why not a delegated child inside the tool:** a plugin tool dispatches through
+`PluginContext.dispatch_tool`, which resolves the parent agent from `get_plugin_manager()._cli_ref` —
+assigned only by the interactive CLI/TUI (`cli_single_query.py:505`, `cli_tui_mixin.py:1859`), never in the
+gateway. `delegate_task` there answers *"requires a parent agent context"*, so an in-tool child would work
+from a terminal and fail on Telegram. When a review must **run** something — the test suite, a diff, a URL —
+use `delegate_task` yourself with the criteria and the paths, and record its verdict with
+`hermes kanban request-review --summary "..."`.
+
 Want the review on a **different model**? Set the route the tool uses — `hermes config set
 auxiliary.review.model <model>` — no profile and no dispatcher needed. (`hermes kanban set-model` is
 task-level: it applies to the implementation run *and* the review run, so it is not the knob for this.)

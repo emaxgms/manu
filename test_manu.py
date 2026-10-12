@@ -10,6 +10,8 @@ import sqlite3
 import sys
 from pathlib import Path
 
+import pytest
+
 _PLUGIN = Path(__file__).parent / "__init__.py"
 # The plugin imports core modules (hermes_cli.kanban_db*) on the real create path;
 # at runtime that tree is always importable, under pytest it must be added by hand.
@@ -18,6 +20,19 @@ _spec = importlib.util.spec_from_file_location("manu_plugin", _PLUGIN)
 manu = importlib.util.module_from_spec(_spec)
 sys.modules["manu_plugin"] = manu
 _spec.loader.exec_module(manu)
+
+
+@pytest.fixture(autouse=True)
+def _clean_worker_env(monkeypatch):
+    """The suite must be green in a clean shell *and* inside a delegated child.
+
+    `_in_worker()` short-circuits the entry hook when HERMES_DELEGATED_CHILD_CONTEXT /
+    HERMES_KANBAN_TASK / HERMES_CRON_SESSION are set, which is exactly the case when a
+    subagent (or a worker) runs this file — 7 tests then fail for no code reason. The one
+    test that exercises those vars sets them itself, after this fixture clears them.
+    """
+    for key in ("HERMES_KANBAN_TASK", "HERMES_CRON_SESSION", "HERMES_DELEGATED_CHILD_CONTEXT"):
+        monkeypatch.delenv(key, raising=False)
 
 
 def _fake_db(tmp, session="s1", status="running", attachments=0, result=None, events=()):

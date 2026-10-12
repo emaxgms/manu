@@ -127,7 +127,13 @@ unverifiable: whether the three names are real sources — no links given
 
 **When the reviewer must run things** — execute the test suite, diff two revisions, open a URL — the aux
 reviewer cannot, so run Check as a **delegated fresh session** instead and record its verdict with
-`hermes kanban request-review <id> --summary "..."`:
+`hermes kanban request-review <id> --summary "..."`. That is also *why* `manu_review` is an aux call and not
+a child: a plugin tool dispatches through `PluginContext.dispatch_tool`, which resolves the parent agent
+from `get_plugin_manager()._cli_ref` (`plugins.py:674-682`, assigned only in `cli_single_query.py:505` and
+`cli_tui_mixin.py:1859`, `None` in the gateway), and `delegate_task` refuses without a parent agent — so an
+in-tool child would work in a terminal and fail on every messaging platform.
+
+The shape:
 
 ```python
 delegate_task(
