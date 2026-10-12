@@ -13,7 +13,9 @@ Everything here was verified against the installed tree at `~/.hermes/hermes-age
   OpenCode relay rejects its aux call with 400 `MissingSessionID`.
 - `todo` — waiting on parents; the dispatcher promotes `todo → ready` when every parent is `done`
   (`hermes kanban promote` forces it).
-- `ready` — claimable. `claim_task` requires `status='ready'` and `assignee IS NOT NULL`.
+- `ready` — claimable. `claim_task` requires `status='ready'`; a manual `hermes kanban claim` succeeds
+  even with `assignee=NULL` (verified live) — it is the DISPATCHER's claim/spawn path that requires a
+  non-NULL assignee (see Assignment and dispatch).
 - `review` — Check phase; `reopen-review --reason` returns it to `ready`/`todo` (the in-session rework
   exit); `request-changes <id> <reason...>` is reviewer-side and requires an active review run.
 - `blocked` — the human bucket. `scheduled` — recurring work.
@@ -24,8 +26,12 @@ Everything here was verified against the installed tree at `~/.hermes/hermes-age
 hermes kanban create "<title>" [--triage] [--assignee <profile>] [--parent <id>]... \
   [--workspace worktree|dir] [--branch <name>] [--project <p>] [--skill <s>]... \
   [--model <override>] [--max-retries N] [--completion-contract OWNER/REPO|local-only] \
-  [--goal] [--goal-max-turns N] [--priority N] [--initial-status blocked|running]
+  [--goal] [--goal-max-turns N] [--priority N] [--initial-status blocked|running] \
+  [--max-runtime 30m|2h|1d] [--idempotency-key <key>]
 hermes kanban link <parent> <child>        # dependency edge (a running child is refused)
+hermes kanban swarm "<goal>" --worker <profile>:<title>[:skill,skill]... --verifier <p> --synthesizer <p>
+hermes kanban set-model <id> <model|none> [--provider <p>]   # per-task worker model override
+hermes kanban schedule <id>                # park in `scheduled` (waiting on time, not a human)
 hermes kanban claim <id>                   # atomic; prints the resolved workspace path
 hermes kanban complete <id> --result "..." [--summary "..."] [--metadata '{...}']
 hermes kanban request-review <id> --summary "what was implemented and how it was verified" [--reviewer <profile>]
@@ -42,7 +48,12 @@ hermes kanban promote <id> ; hermes kanban archive <id> ; hermes kanban stats
 - `goal_mode` (+`goal_max_turns`): an auxiliary **judge** re-reads the worker's output against the
   card's title/body and keeps it going until done, or blocks it for human review when the turn budget
   runs out. That is the native evaluator loop for open-ended cards.
-- `swarm`: one command builds the parallel workers → verifier → synthesizer graph.
+- `swarm`: `--worker` is repeatable (`profile:title[:skill,skill]`), `--verifier` and `--synthesizer`
+  are required; the graph commits atomically (root blackboard → parallel workers → verifier →
+  synthesizer).
+- `hermes kanban daemon` is deprecated in this build — the dispatcher runs inside the gateway
+  (`kanban.dispatch_in_gateway`); `hermes kanban dispatch [--dry-run]` is the single-pass form, and
+  `--dry-run` names what a tick would spawn and what it held back (`respawn_guarded`, `rate_limited`).
 
 ## Failure handling and retry budget
 
@@ -56,7 +67,8 @@ hermes kanban promote <id> ; hermes kanban archive <id> ; hermes kanban stats
 
 ## Assignment and dispatch
 
-- A card with `assignee=NULL` is **never claimed** (`kanban_db_dispatch.py:1232`).
+- A card with `assignee=NULL` is never claimed **by the dispatcher** (`kanban_db_dispatch.py:1232`);
+  manual `hermes kanban claim` works on an unassigned `ready` card.
 - The dispatcher auto-assigns unassigned `ready` cards to `kanban.default_assignee` when it encounters
   them (`kanban_db_dispatch.py:1529`, `hermes_cli/kanban.py:630`).
 - Workers run as separate subprocesses (`hermes -p <assignee> chat -q`): same profile, **new session,
@@ -66,6 +78,10 @@ hermes kanban promote <id> ; hermes kanban archive <id> ; hermes kanban stats
   `kanban.failure_limit`.
 - `hermes project create|add-folder|bind-board` gives non-git work (research, dashboards, document
   sets) a named workspace and a deterministic worktree/branch convention for its board.
+- `assignee` is written only at creation or by explicit `hermes kanban assign <id> <profile|none>`.
+  `claim` → `running` → `review` → `done` never touch it: a card created without one stays `NULL`
+  for its whole lifecycle (verified live: claimed, completed, still `(unassigned)`). `assign` is
+  refused while the card is `running` AND claimed — backfill a legacy orphan after `complete`.
 
 ## Specifier and decomposer
 
@@ -93,8 +109,20 @@ From `website/docs/developer-guide/plugins/index.md`:
 - `pre_llm_call` — fires **once per turn**, before the tool loop; returning `{"context": ...}` injects
   that text into the **current turn's** user message (tail-only, so it stays cache-safe). This is the
   recitation hook: inject one line of state, or return `None` when there is nothing to say.
-- `pre_tool_call` — may return `{"action": "block", "message": ...}` to veto a tool call, or
-  `{"action": "approve"}` to escalate it to the human approval gate. This is the closure/evidence gate.
+- `pre_llm_call` — fires **once per turn**, before the tool loop; returning `{"context": ...}` injects
+  that text into the **current turn's** user message (tail-only, so it stays cache-safe). This is the
+  recitation hook: inject one line of state, or return `None` when there is nothing to say. Real
+  callback kwargs: `session_id, user_message, conversation_history, is_first_turn, model, platform` —
+  the per-turn tick, so reset per-turn counters here rather than keying them on the turn id.
+- `pre_tool_call` — may return `{"action": "block", "message": ...}` to veto a tool call,
+  `{"action": "approve"}` to escalate it to the human approval gate, or `{"action": "modify",
+  "args": {...}}` to shallow-merge args before dispatch. This is the closure/evidence gate, and the
+  only hook that can stop work **before** it happens.
+  Real callback kwargs (`hermes_cli/plugins.py:1988`) are richer than the docs table: `tool_name,
+  args, task_id, session_id, tool_call_id, turn_id, api_request_id, middleware_trace`. `session_id` is
+  what makes a session-scoped gate possible at all ("no card open for THIS session"), and `turn_id`
+  scopes a rule to the current turn instead of the whole session — the difference between blocking a
+  research turn and blocking the fourth unrelated quick lookup of a long chat.
 - `post_tool_call`, `pre_api_request`, `post_api_request`, `on_session_start`, `on_session_end`,
   `on_session_reset` — observers.
 - `kanban_task_claimed` (dispatcher process), `kanban_task_completed` / `kanban_task_blocked` (worker

@@ -5,6 +5,7 @@ tested exactly as Hermes loads it, with no package/name assumptions.
 """
 
 import importlib.util
+import json
 import sqlite3
 import sys
 from pathlib import Path
@@ -87,7 +88,9 @@ def test_looks_like_work_detects_real_requests():
         "possiamo fare una adversarial review e scrivere dei file .md piu efficienti ?"
     )
     assert manu.looks_like_work("scrivi un report sul confronto tra i tre stack LoRa e salvalo")
-    assert manu.looks_like_work("x" * 250)
+    # an explicit ask is work even inside a question (corpus: "puoi verificare cosa abbiamo fatto?")
+    assert manu.looks_like_work("ho fatto un test, la task e' creata ma unassigned, puoi verificare?")
+    assert manu.looks_like_work("Analizza se nelle ultime due task e' stato usato il processo definito")
 
 
 def test_looks_like_work_ignores_quick_questions():
@@ -96,6 +99,50 @@ def test_looks_like_work_ignores_quick_questions():
     assert not manu.looks_like_work("how do I list the kanban cards?")
     assert not manu.looks_like_work("")
     assert not manu.looks_like_work(None)
+
+
+def test_classifier_regressions_from_the_labelled_corpus():
+    """Cases that the pre-2026-10-12 word list got wrong (see docs/entry-classifier.md).
+
+    Measured on 45 real requests: false positives 10 -> 2, false negatives 2 -> 0.
+    Each assertion below is one of those flips.
+    """
+    # a long message is not work: the old 200-char rule turned 8 complaints into cards
+    assert not manu.looks_like_work(
+        "Non capisco, il piano basato su quello che abbiamo visto prima, quindi superpowers, bmad, "
+        "come vuole farlo quindi? Usando kanban senza dispatcher o il modello che assegna le task?"
+    )
+    # a work stem inside a question sentence is not an instruction
+    assert not manu.looks_like_work(
+        "Non ho capito, questi come implementano questi flussi? Sempre solo con skill, quindi prompt?"
+    )
+    assert not manu.looks_like_work(
+        "ma che senso ha??? non ha nessun senso implementarlo cosi, chi l'ha usato questo meccanismo?"
+    )
+    # word-start matching: "preview" is not "review", "generative" is not "genera"
+    assert not manu.looks_like_work("non vedo la nuova preview, perche' non e' partita la action?")
+    assert not manu.looks_like_work("No io intendo lharness, poi il provider lo troviamo. ho sentito di open-generative-ai")
+    # stems dropped because every hit they produced was a false positive: build / setup / genera
+    assert not manu.looks_like_work(
+        "voglio un processo che valuti la complessita: se semplice si risponde, altrimenti plan, "
+        "build, evaluate, rework loop till the requirements are satisfied"
+    )
+    # ...but the change verbs that were missing now open the card
+    assert manu.looks_like_work("Voglio modificare una parte del processo, il rework non riparte da Plan")
+    assert manu.looks_like_work("Io pulirei anche le skill inutili, brainstorming sembra interessante pero'")
+
+
+def test_entry_never_opens_a_card_for_a_long_rant(tmp_path):
+    """End to end: the length heuristic is gone, so a 700-char complaint stays silent."""
+    db = _fake_db(tmp_path, session="other")
+    complaint = (
+        "minchia non riesco a capire come funziona, continui a usare nomi e meccanismi strani. "
+        "quante volte ti devo dire la semplice cosa che voglio fare? voglio un processo che parta "
+        "dalla chat e valuti la complessita, se semplice si risponde normalmente senza passaggi, "
+        "se medio o difficile si passa dallo standard plan, build, evaluate, rework."
+    )
+    assert len(complaint) > 200
+    assert manu._entry_hook(user_message=complaint, session_id="s1", _db=db, _create=lambda *a: "nope") is None
 
 
 def test_looks_like_work_ignores_gateway_generated_messages():
@@ -330,7 +377,130 @@ def test_register_wires_hooks_and_tool():
 
     manu.register(_Ctx())
     assert seen["hooks"] == ["pre_llm_call", "pre_tool_call"], seen
-    assert seen["tools"] == ["manu_specify"], seen
+    assert seen["tools"] == ["manu_specify", "manu_review"], seen
+
+
+# --- Check in a fresh context (manu_review) -------------------------------
+
+_CRITERIA = "**Acceptance criteria**\n- [ ] AC1: the report cites 5 sources\n- [ ] AC2: the tests pass"
+
+_REVIEW_REPLY = json.dumps({
+    "criteria": [
+        {"criterion": "AC1: the report cites 5 sources", "verdict": "met", "evidence": "report.md:12"},
+        {"criterion": "AC2: the tests pass", "verdict": "partial", "evidence": "only 3 test names listed"},
+    ],
+    "unverifiable": ["the tests were not run in front of me"],
+    "verdict": "partial",
+    "summary": "One criterion is evidence-backed, one is a claim in the body.",
+})
+
+
+def _board(tmp_path, status="running"):
+    """A real board (core schema) with one card carrying criteria and one artifact."""
+    sys.path.insert(0, str(Path.home() / ".hermes" / "hermes-agent"))
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    path = tmp_path / "kanban.db"
+    report = tmp_path / "report.md"
+    report.write_text("# report\n1. source one\n2. source two\n")
+    with kbc.connect_closing(path) as conn:
+        task_id = kb.create_task(conn, title="Write the report", body=_CRITERIA, assignee="default")
+        if status == "running":
+            kb.claim_task(conn, task_id, claimer="test:1")
+        kb.add_attachment(conn, task_id, filename="report.md", stored_path=str(report),
+                          content_type="text/markdown", uploaded_by="test")
+    return path, task_id, report
+
+
+def test_review_requires_task_id():
+    r = manu.review("")
+    assert r["success"] is False and "task_id" in r["error"]
+
+
+def test_review_refuses_a_card_that_is_not_in_do(tmp_path):
+    """A card still in Plan has nothing to Check — and must not spend a review call."""
+    path, task_id, _ = _board(tmp_path, status="ready")
+
+    def _boom(_user):
+        raise AssertionError("the reviewer must not run for a card in Plan")
+
+    r = manu.review(task_id, db=path, _llm=_boom)
+    assert r["success"] is False and "ready" in r["error"], r
+    assert "manu_review" not in r
+
+
+def test_review_records_the_verdict_verbatim_on_the_card(tmp_path):
+    """The whole point: the reviewer's per-criterion verdict becomes the card's Check."""
+    path, task_id, report = _board(tmp_path)
+    seen = {}
+
+    def _llm(user):
+        seen["user"] = user
+        return _REVIEW_REPLY, "stub-model"
+
+    r = manu.review(task_id, [str(report)], db=path, _llm=_llm)
+    assert r["success"] is True, r
+    assert r["verdict"] == "partial" and r["recorded"] == "review_requested"
+    assert [c["verdict"] for c in r["criteria"]] == ["met", "partial"]
+    assert r["unverifiable"] == ["the tests were not run in front of me"]
+    assert r["model"] == "stub-model"
+
+    # the reviewer saw the criteria and the artifact text — and nothing about the author
+    assert "AC2: the tests pass" in seen["user"] and "2. source two" in seen["user"]
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    with kbc.connect_closing(path) as conn:
+        row = conn.execute(
+            "select payload from task_events where task_id = ? and kind = 'review_requested'",
+            (task_id,),
+        ).fetchone()
+        status = kb.get_task(conn, task_id).status
+        run = conn.execute(
+            "select summary from task_runs where task_id = ? order by id desc limit 1", (task_id,)
+        ).fetchone()
+    assert status == "review", status
+    payload = json.loads(row["payload"])
+    # the event payload keeps core's first line (400 chars): verdicts must ride there
+    assert "verdict: partial" in payload["summary"], payload["summary"]
+    assert "[met] AC1: the report cites 5 sources" in payload["summary"], payload["summary"]
+    assert "[partial] AC2: the tests pass" in payload["summary"]
+    assert payload["summary"].count("\n") == 0, payload["summary"]
+    # the run row keeps the whole Check, evidence lines included
+    assert "- [met] AC1: the report cites 5 sources — report.md:12" in run["summary"], run["summary"]
+    assert "unverifiable: the tests were not run in front of me" in run["summary"]
+
+
+def test_review_keeps_an_unparseable_reply_as_evidence(tmp_path):
+    """A model that ignores the JSON contract must not produce an empty Check."""
+    path, task_id, _ = _board(tmp_path)
+    r = manu.review(task_id, db=path, _llm=lambda _u: ("Looks good to me, ship it.", "stub-model"))
+    assert r["success"] is True and r["verdict"] is None
+    from hermes_cli import kanban_db_connect as kbc
+
+    with kbc.connect_closing(path) as conn:
+        payload = json.loads(conn.execute(
+            "select payload from task_events where task_id = ? and kind = 'review_requested'",
+            (task_id,),
+        ).fetchone()["payload"])
+    assert "Looks good to me, ship it." in payload["summary"]
+
+
+def test_review_reports_an_unknown_card(tmp_path):
+    path, _, _ = _board(tmp_path)
+    r = manu.review("t_nope", db=path, _llm=lambda _u: (_REVIEW_REPLY, "stub"))
+    assert r["success"] is False and "unknown" in r["error"], r
+
+
+def test_review_material_caps_and_never_raises(tmp_path):
+    big = tmp_path / "big.txt"
+    big.write_text("x" * 50000)
+    binary = tmp_path / "blob.bin"
+    binary.write_bytes(b"\x00\x01\x02" * 100)
+    block = manu._review_material([], [str(big), str(binary), str(tmp_path / "missing.txt")])
+    assert len(block) < manu._ARTIFACT_CAP + 2000, len(block)
+    assert "binary — not inlined" in block and "could not read" in block
 
 
 # --- phase map ------------------------------------------------------------
