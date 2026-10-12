@@ -472,19 +472,35 @@ def test_review_records_the_verdict_verbatim_on_the_card(tmp_path):
     assert "unverifiable: the tests were not run in front of me" in run["summary"]
 
 
-def test_review_keeps_an_unparseable_reply_as_evidence(tmp_path):
-    """A model that ignores the JSON contract must not produce an empty Check."""
+def test_review_refuses_an_unparseable_reply_and_records_nothing(tmp_path):
+    """A reply cut off mid-JSON is not a Check: the gate must not accept it.
+
+    Observed live: ten long criteria made the reviewer echo them and hit the token
+    ceiling, and the truncated JSON was recorded as a pass. Now it is refused.
+    """
     path, task_id, _ = _board(tmp_path)
-    r = manu.review(task_id, db=path, _llm=lambda _u: ("Looks good to me, ship it.", "stub-model"))
-    assert r["success"] is True and r["verdict"] is None
+    truncated = _REVIEW_REPLY[: len(_REVIEW_REPLY) // 2]
+    r = manu.review(task_id, db=path, _llm=lambda _u: (truncated, "stub-model"))
+    assert r["success"] is False and "not a JSON verdict" in r["error"], r
+    assert r["raw"].startswith('{"criteria"')
+    from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
 
     with kbc.connect_closing(path) as conn:
-        payload = json.loads(conn.execute(
-            "select payload from task_events where task_id = ? and kind = 'review_requested'",
+        status = kb.get_task(conn, task_id).status
+        events = conn.execute(
+            "select count(*) from task_events where task_id = ? and kind = 'review_requested'",
             (task_id,),
-        ).fetchone()["payload"])
-    assert "Looks good to me, ship it." in payload["summary"]
+        ).fetchone()[0]
+    assert status == "running" and events == 0, (status, events)
+
+
+def test_review_tolerates_prose_around_a_valid_json_verdict(tmp_path):
+    """A fence or a sentence before the object is fine — the JSON is what is read."""
+    path, task_id, _ = _board(tmp_path)
+    chatty = f"Here is my verdict:\n```json\n{_REVIEW_REPLY}\n```\n"
+    r = manu.review(task_id, db=path, _llm=lambda _u: (chatty, "stub-model"))
+    assert r["success"] is True and r["verdict"] == "partial", r
 
 
 def test_review_reports_an_unknown_card(tmp_path):

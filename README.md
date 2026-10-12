@@ -82,6 +82,10 @@ verify as unverified — the reviewer is instructed to say so rather than round 
 the failure mode that matters most in one long session: a reviewer that inherits the author's plan,
 claims and rationalizations.
 
+A verdict that comes back truncated or malformed is **refused, not recorded**: the tool returns
+`success=false` with the raw reply and leaves the card in Do, because a Check the gate accepts but nobody
+can read is worse than no Check at all.
+
 Want the review on a **different model**? Set the route the tool uses — `hermes config set
 auxiliary.review.model <model>` — no profile and no dispatcher needed. (`hermes kanban set-model` is
 task-level: it applies to the implementation run *and* the review run, so it is not the knob for this.)

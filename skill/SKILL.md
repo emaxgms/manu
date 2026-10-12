@@ -117,6 +117,10 @@ unverifiable: whether the three names are real sources — no links given
   (`hermes kanban runs <id>`).
 - Read the returned JSON and **act on a `partial`/`fail`**: fix the artifact, then run `manu_review` again
   (or `reopen-review` after the close if the card already moved). A recorded Check is not a passing Check.
+- **An unreadable verdict is not recorded.** If the reply comes back truncated or not as a JSON object,
+  the tool returns `success=false`, hands you the raw reply, and leaves the card in Do — the gate must not
+  accept a Check nobody can read. (Live case: ten long criteria made the reviewer echo them past the token
+  ceiling; the budget was raised and the prompt now bounds each field.)
 - **A different reviewer *model* is a config line, not a profile**: `hermes config set auxiliary.review.model
   <model>` (and `.provider` if needed). By default that route falls through to your main model — the same
   model as the author, minus the author's context, which is the trade this design takes.

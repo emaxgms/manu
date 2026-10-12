@@ -526,7 +526,10 @@ def _specify_handler(args: dict, **kwargs) -> str:
 #: Total inlined artifact text, and the per-file cap. Every byte inlines into the
 #: reviewer's single prompt: it has no tools and no filesystem.
 _ARTIFACT_CAP, _ARTIFACT_EACH = 48000, 16000
-_REVIEW_MAX_TOKENS = 4000
+#: Verdict budget. A card with ten long criteria made the reviewer echo them and
+#: run out of room mid-JSON — which is why an unparseable reply is *not* recorded
+#: (below) and why the prompt asks for bounded lengths.
+_REVIEW_MAX_TOKENS = 8000
 
 _REVIEW_SYSTEM = """You are the independent Check on a Hermes kanban card (phases: Plan / Do / Check / Close).
 You did not do this work. You cannot see the author's conversation, its plan, its reasoning or its claims:
@@ -545,6 +548,8 @@ Output one JSON object and nothing else:
 Rules:
   - One entry per acceptance criterion on the card, in card order. A card with no
     acceptance criteria gets an empty list and says so in summary.
+  - Quote each criterion in <= 25 words and each evidence field in <= 30 words: a
+    report that is cut off mid-sentence cannot be read as a verdict.
   - "pass" requires every criterion "met" AND an empty unverifiable list.
     Anything else is "partial" or "fail" — never round up.
   - Never invent evidence you were not given. A missing artifact is unverifiable,
@@ -614,7 +619,7 @@ def _json_object(text: str) -> Optional[dict]:
     return parsed if isinstance(parsed, dict) else None
 
 
-def _verdict_summary(parsed: Optional[dict], raw: str, model: str) -> str:
+def _verdict_summary(parsed: dict, model: str) -> str:
     """The reviewer's own words as the card's Check record.
 
     The first line is what the ``review_requested`` payload keeps (core stores
@@ -622,8 +627,6 @@ def _verdict_summary(parsed: Optional[dict], raw: str, model: str) -> str:
     the full evidence lines follow and survive on the run row (`hermes kanban runs`).
     """
     head = f"manu_review [{model or 'configured review route'}]"
-    if parsed is None:
-        return f"{head} — unparseable verdict: {' '.join(raw.split())[:300]}"
     verdict = parsed.get("verdict") or "partial"
     entries = [e for e in parsed.get("criteria") or [] if isinstance(e, dict)]
     marks = " | ".join(
@@ -722,7 +725,21 @@ def review(
                 raw, model = _llm(user)
             raw = raw or ""
             parsed = _json_object(raw)
-            summary = _verdict_summary(parsed, raw, model)
+            if parsed is None:
+                # An unreadable verdict is not a Check: recording it would let the
+                # gate accept a review nobody can read. The caller gets the reply back.
+                return {
+                    "success": False,
+                    "task_id": task_id,
+                    "model": model,
+                    "error": (
+                        "reviewer reply was not a JSON verdict (truncated or malformed): nothing "
+                        "recorded, the card stays in Do. Re-run, or shorten the criteria, or record "
+                        "your own summary with `hermes kanban request-review --summary`."
+                    ),
+                    "raw": raw[:2000],
+                }
+            summary = _verdict_summary(parsed, model)
             outcome = kb.request_review(conn, task_id, summary=summary, with_reason=True)
             ok, reason = outcome if isinstance(outcome, tuple) else (bool(outcome), "")
     except Exception as exc:
