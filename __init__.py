@@ -57,22 +57,49 @@ ARTIFACTS = ("write_file", "patch")
 #: kanban lifecycle events that record a Check pass or a rework handoff.
 _REVIEW_EVENTS = ("review_requested", "changes_requested", "review_reopened")
 
-#: Word stems meaning "this produces an artifact or spans steps" (IT + EN).
+#: Word stems meaning "this produces an artifact or spans steps" (IT + EN), matched
+#: at a word start so "preview" is not "review" and "generative" is not "genera".
+#: Measured against 45 real requests (`docs/entry-classifier.md`): 73% -> 96%
+#: accuracy, false positives 10 -> 2. Bare "build"/"setup"/"genera" and the old
+#: 200-char length rule were dropped — every hit they produced was a question or a
+#: rant, never work.
 #: ponytail: a word list, not a classifier — swap `looks_like_work` for one
-#: auxiliary call if it keeps misfiring; the seam is that single function.
+#: auxiliary call if the two remaining false-positive classes matter; the seam is
+#: that single function.
 WORK_SIGNALS = (
-    "implement", "refactor", "riscr", "rewrit", "build", "crea", "costruisci",
-    "ricerca", "research", "analis", "analy", "report", "document", "script",
-    "migra", "integrat", "automat", "configur", "setup", "set up", "deploy",
-    "progetta", "design", "ottimizz", "optimi", "debug", "sistem", "confronta",
-    "compare", "valuta", "review", "audit", "scriv", "write", "genera",
-    "generate", "make me", "help me", "add ", "aggiungi", "aggiorna", "update",
-    "installa", "pianifica",
+    "implement", "refactor", "riscr", "rewrit", "crea", "costruisci", "ricerca", "research",
+    "analis", "analizz", "report", "document", "script", "migra", "integrat", "automat",
+    "configur", "deploy", "progetta", "design", "ottimizz", "optimi", "debug", "sistem",
+    "confronta", "compare", "valuta", "review", "audit", "scriv", "write", "make me",
+    "help me", "add ", "aggiungi", "aggiorna", "update", "installa", "pianifica",
+    "modific", "togli", "rimuov", "elimina", "cancella", "pulir", "pulisc", "miglior",
+    "improve", "fix", "salva", "save", "check", "verifica", "controlla", "esegui", "lancia",
+    "riassumi", "summarize", "traduci", "spiega", "explain",
 )
-#: A message longer than this is treated as work even without a signal word.
-WORK_MIN_CHARS = 200
-#: A short question is a lookup; it never opens a card.
-QUESTION_MAX_CHARS = 140
+#: The subset that counts *anywhere*, including inside a question: an explicit ask
+#: ("puoi verificare cosa abbiamo fatto?") is work even when it is phrased as one.
+ASK_SIGNALS = (
+    "fai ", "fammi", "make me", "crea", "creami", "create", "scrivi", "scrivere", "scrivimi",
+    "write", "riscrivi", "aggiungi", "add ", "installa", "aggiorna", "update", "migra",
+    "progetta", "pianifica", "ottimizza", "debug", "configura", "deploy", "automatizza",
+    "documenta", "analizza", "analyze", "verifica", "controlla", "valuta", "valutiam",
+    "confronta", "compare", "review", "audit", "ricerca", "ricerchiamo", "research", "report",
+    "lancia", "esegui", "fix", "sistema", "modifica", "migliora", "togli", "rimuovi",
+    "elimina", "pulir", "pulisc", "traduci", "riassumi", "summarize", "spiegami", "spiega",
+)
+#: A message shorter than this is a reflex reply, never a request.
+WORK_MIN_CHARS = 20
+
+
+def _signal_re(stems) -> re.Pattern:
+    """``\\b(stem|stem|...)`` — longest first, so "scrivere" can never be masked by "scrivi"."""
+    return re.compile(r"\b(?:" + "|".join(re.escape(s) for s in sorted(stems, key=len, reverse=True)) + ")")
+
+
+_SIGNAL_RE = _signal_re(WORK_SIGNALS)
+_ASK_RE = _signal_re(ASK_SIGNALS)
+#: Sentence boundaries: a stem inside a question sentence is not an instruction.
+_SENTENCE_RE = re.compile(r"(?<=[.!?])\s+|\n+")
 
 #: Gateway-generated text that arrives in the user role but is never a user
 #: request: delegation results and system notices. Without this the gate opens a
@@ -219,19 +246,27 @@ def looks_like_work(message: Optional[str]) -> bool:
 
     The question the plugin can answer before any action exists — and the one
     the model cannot answer reliably at that same moment.
+
+    Three rules, in order, and the measurement behind them is in
+    ``docs/entry-classifier.md``:
+
+    1. an explicit ask ("fammi", "puoi verificare?") is work even inside a question;
+    2. a work stem inside a **question sentence** is not an instruction — that is
+       what separated the real requests from the rants in the labelled corpus;
+    3. length decides nothing. A long question is still a question.
     """
     text = " ".join((message or "").lower().split())
-    if len(text) < 20:
+    if len(text) < WORK_MIN_CHARS:
         return False
     if any(marker in text for marker in _INTERNAL_MARKERS):
         return False
-    if text.endswith("?") and len(text) < QUESTION_MAX_CHARS and not any(
-        s in text for s in WORK_SIGNALS
-    ):
-        return False
-    if any(s in text for s in WORK_SIGNALS):
+    if _ASK_RE.search(text):
         return True
-    return len(text) > WORK_MIN_CHARS
+    return any(
+        _SIGNAL_RE.search(sentence)
+        for sentence in _SENTENCE_RE.split(text)
+        if not sentence.rstrip().endswith("?")
+    )
 
 
 def _in_worker() -> bool:
@@ -486,6 +521,279 @@ def _specify_handler(args: dict, **kwargs) -> str:
     return json.dumps(specify((args or {}).get("task_id")))
 
 
+# --- Check in a fresh context (the manu_review tool) ------------------------
+
+#: Total inlined artifact text, and the per-file cap. Every byte inlines into the
+#: reviewer's single prompt: it has no tools and no filesystem.
+_ARTIFACT_CAP, _ARTIFACT_EACH = 48000, 16000
+#: Verdict budget. A card with ten long criteria made the reviewer echo them and
+#: run out of room mid-JSON — which is why an unparseable reply is *not* recorded
+#: (below) and why the prompt asks for bounded lengths.
+_REVIEW_MAX_TOKENS = 8000
+
+_REVIEW_SYSTEM = """You are the independent Check on a Hermes kanban card (phases: Plan / Do / Check / Close).
+You did not do this work. You cannot see the author's conversation, its plan, its reasoning or its claims:
+your context is this prompt, the card text and the artifact content below, and nothing else.
+Judge the work against the card's acceptance criteria, and nothing else.
+
+Output one JSON object and nothing else:
+
+  {"criteria": [{"criterion": "<acceptance criterion, quoted short>",
+                 "verdict": "met|not_met|partial",
+                 "evidence": "<the file/line/output that shows it, or what is missing>"}],
+   "unverifiable": ["<what you cannot check from the material given>"],
+   "verdict": "pass|fail|partial",
+   "summary": "<two lines, plain, no praise>"}
+
+Rules:
+  - One entry per acceptance criterion on the card, in card order. A card with no
+    acceptance criteria gets an empty list and says so in summary.
+  - Quote each criterion in <= 25 words and each evidence field in <= 30 words: a
+    report that is cut off mid-sentence cannot be read as a verdict.
+  - "pass" requires every criterion "met" AND an empty unverifiable list.
+    Anything else is "partial" or "fail" — never round up.
+  - Never invent evidence you were not given. A missing artifact is unverifiable,
+    and a claim in the card body is not evidence of itself.
+  - No preamble, no code fences, no closing remarks.
+"""
+
+_REVIEW_USER = """Card {task_id} — {title}
+Status: {status}
+
+Card body (carries the acceptance criteria):
+{body}
+
+Artifacts:
+{artifacts}
+"""
+
+
+def _artifact_block(label: str, path: str, budget: int) -> Tuple[str, int]:
+    """``(text_block, chars_used)`` for one artifact, capped and never raising.
+
+    Truncation is **stated in the block**: a reviewer that cannot tell a full file
+    from a clipped one will call a missing tail "not met".
+    """
+    p = Path(path)
+    limit = min(_ARTIFACT_EACH, budget)
+    try:
+        raw = p.read_bytes()[: max(0, limit)]
+        size = p.stat().st_size
+    except OSError as exc:
+        return f"--- {label} ({path})\n(could not read: {type(exc).__name__})\n", 0
+    if b"\x00" in raw[:4096]:
+        return f"--- {label} ({path})\n({size} bytes, binary — not inlined)\n", 0
+    text = raw.decode("utf-8", "replace")
+    note = f"\n[... truncated: {size} bytes on disk, first {len(text)} inlined ...]\n" if size > len(text) else ""
+    return f"--- {label} ({path})\n{text}{note}\n", len(text)
+
+
+def _review_material(attachments: Optional[list] = None, artifacts: Optional[list] = None) -> str:
+    """Every artifact the reviewer gets, inlined up to the global budget."""
+    blocks: list = []
+    budget = _ARTIFACT_CAP
+    for att in attachments or []:
+        block, used = _artifact_block(getattr(att, "filename", None) or "attachment",
+                                      getattr(att, "stored_path", ""), budget)
+        blocks.append(block)
+        budget -= used
+    for path in artifacts or []:
+        block, used = _artifact_block("declared artifact", str(path), budget)
+        blocks.append(block)
+        budget -= used
+    return "".join(blocks) or "(none — the card carries no attachment and none was declared)\n"
+
+
+def _json_object(text: str) -> Optional[dict]:
+    """First ``{...}`` blob in *text*, or None. Lenient: fences and prose tolerated.
+
+    ponytail: local 8 lines rather than importing core's private ``_extract_json_blob``.
+    """
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        parsed = json.loads(text[start : end + 1])
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _verdict_summary(parsed: dict, model: str) -> str:
+    """The reviewer's own words as the card's Check record.
+
+    The first line is what the ``review_requested`` payload keeps (core stores
+    ``_first_line(summary, 400)``), so the per-criterion verdicts ride there;
+    the full evidence lines follow and survive on the run row (`hermes kanban runs`).
+    """
+    head = f"manu_review [{model or 'configured review route'}]"
+    verdict = parsed.get("verdict") or "partial"
+    entries = [e for e in parsed.get("criteria") or [] if isinstance(e, dict)]
+    marks = " | ".join(
+        f"[{e.get('verdict')}] {' '.join(str(e.get('criterion') or '').split())[:60]}" for e in entries
+    )
+    if not marks:
+        marks = "no acceptance criteria on the card"
+    unverifiable = [str(u) for u in parsed.get("unverifiable") or []]
+    first = f"{head} — verdict: {verdict} | {marks}"
+    if unverifiable:
+        first += f" | unverifiable: {len(unverifiable)}"
+    detail = [
+        f"- [{e.get('verdict')}] {e.get('criterion')} — {e.get('evidence') or 'no evidence given'}"
+        for e in entries
+    ]
+    detail += [f"unverifiable: {u}" for u in unverifiable]
+    if parsed.get("summary"):
+        detail.append(f"summary: {parsed['summary']}")
+    return first[:400] + ("\n" + "\n".join(detail) if detail else "")
+
+
+def _call_review_llm(task_id: str, user: str, timeout: int = 180) -> Any:
+    """One auxiliary call on ``auxiliary.review.*`` — the reviewer's whole context."""
+    from agent.auxiliary_client import call_llm
+    # The relay-affinity headers need a scope; inside a turn the conversation's own is
+    # bound and kept, outside one declare a per-card scope (same contract as kanban_specify).
+    from agent.portal_tags import get_affinity_scope, reset_affinity_scope, set_affinity_scope
+
+    token = None if get_affinity_scope() else set_affinity_scope(f"kanban:{task_id}")
+    try:
+        return call_llm(
+            task="review",
+            messages=[{"role": "system", "content": _REVIEW_SYSTEM}, {"role": "user", "content": user}],
+            temperature=0,
+            max_tokens=_REVIEW_MAX_TOKENS,
+            timeout=timeout,
+        )
+    finally:
+        if token is not None:
+            reset_affinity_scope(token)
+
+
+def review(
+    task_id: str,
+    artifacts: Optional[list] = None,
+    *,
+    db=None,
+    board: Optional[str] = None,
+    _llm=None,
+    _session=None,
+) -> dict:
+    """Check: review the card in a context that never saw the author's, then record it.
+
+    (a) read the card title, body and artifact paths, (b) run the review through
+    ``auxiliary.review.*`` with that material as its whole context, (c) write the
+    verdict verbatim as the card's review summary — the event the Check gate reads —
+    (d) return JSON. Never raises: the caller is a tool handler.
+
+    The reviewer has no tools: it judges the text it is handed. It therefore cannot
+    execute anything, and anything it could not verify must come back as
+    ``unverifiable`` rather than as a pass.
+    """
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        return {"success": False, "error": "task_id is required"}
+    try:
+        from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
+
+        manager = _session or kbc.connect_closing(Path(db) if db is not None else None, board=board)
+        with manager as conn:
+            task = kb.get_task(conn, task_id)
+            if task is None:
+                return {"success": False, "task_id": task_id, "error": "unknown task id"}
+            if task.status != "running":
+                return {
+                    "success": False, "task_id": task_id,
+                    "error": f"card is {task.status!r}: Check runs on a claimed card (`running`)",
+                }
+            attachments = kb.list_attachments(conn, task_id)
+            user = _REVIEW_USER.format(
+                task_id=task.id,
+                title=task.title or "(untitled)",
+                status=task.status,
+                body=(task.body or "(no body — no acceptance criteria to verify against)").strip(),
+                artifacts=_review_material(attachments, artifacts),
+            )
+            if _llm is None:
+                response = _call_review_llm(task_id, user)
+                try:
+                    raw = response.choices[0].message.content or ""
+                except Exception:
+                    raw = ""
+                model = str(getattr(response, "model", "") or "")
+            else:  # injected stub: (reply_text, model)
+                raw, model = _llm(user)
+            raw = raw or ""
+            parsed = _json_object(raw)
+            if parsed is None:
+                # An unreadable verdict is not a Check: recording it would let the
+                # gate accept a review nobody can read. The caller gets the reply back.
+                return {
+                    "success": False,
+                    "task_id": task_id,
+                    "model": model,
+                    "error": (
+                        "reviewer reply was not a JSON verdict (truncated or malformed): nothing "
+                        "recorded, the card stays in Do. Re-run, or shorten the criteria, or record "
+                        "your own summary with `hermes kanban request-review --summary`."
+                    ),
+                    "raw": raw[:2000],
+                }
+            summary = _verdict_summary(parsed, model)
+            outcome = kb.request_review(conn, task_id, summary=summary, with_reason=True)
+            ok, reason = outcome if isinstance(outcome, tuple) else (bool(outcome), "")
+    except Exception as exc:
+        return {"success": False, "task_id": task_id, "error": f"{type(exc).__name__}: {exc}"}
+    if not ok:
+        return {"success": False, "task_id": task_id, "error": f"review not recorded: {reason}"}
+    return {
+        "success": True,
+        "task_id": task_id,
+        "verdict": (parsed or {}).get("verdict"),
+        "criteria": [
+            {"criterion": e.get("criterion"), "verdict": e.get("verdict")}
+            for e in (parsed or {}).get("criteria") or [] if isinstance(e, dict)
+        ],
+        "unverifiable": (parsed or {}).get("unverifiable") or [],
+        "model": model,
+        "recorded": "review_requested",
+    }
+
+
+def _review_handler(args: dict, **kwargs) -> str:
+    args = args or {}
+    return json.dumps(review(str(args.get("task_id") or ""), args.get("artifacts")))
+
+
+_REVIEW_SCHEMA = {
+    "name": "manu_review",
+    "description": (
+        "Check step: run the card's review in a fresh context (the reviewer never sees this "
+        "conversation, your plan or your reasoning — only the card text and the artifacts you "
+        "name) and record its per-criterion verdict as the card's review summary, which is what "
+        "the Check gate reads. Run it instead of `hermes kanban request-review` on any card whose "
+        "review matters; a summary written from memory passes the gate without being a review. "
+        "The reviewer cannot run commands: it judges the card and the inlined artifact text, so "
+        "pass the paths of what you built in `artifacts`. Returns JSON."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": "Card id, in `running` (Do)."},
+            "artifacts": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "File paths the reviewer must judge, inlined into its prompt. The card's own "
+                    "attachments are added automatically."
+                ),
+            },
+        },
+        "required": ["task_id"],
+    },
+}
+
+
 def register(ctx: Any) -> None:
     ctx.register_hook("pre_llm_call", _entry_hook)
     ctx.register_hook("pre_tool_call", gate)
@@ -495,4 +803,11 @@ def register(ctx: Any) -> None:
         schema=_SPECIFY_SCHEMA,
         handler=_specify_handler,
         description="Write the acceptance criteria of a triage card in-process (Plan phase)",
+    )
+    ctx.register_tool(
+        name="manu_review",
+        toolset="manu",
+        schema=_REVIEW_SCHEMA,
+        handler=_review_handler,
+        description="Run Check in a fresh context and record the verdict on the card",
     )

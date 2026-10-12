@@ -1,17 +1,19 @@
 name: manu
-version: 0.2.0
+version: 0.3.0
 description: >-
   Process layer (Plan / Do / Check / Close) over the Hermes kanban board, with a
   rework loop back to Plan. The skill holds the process content; this plugin
   holds the gates: it opens the Plan card before the first action of a
   work-shaped request, refuses file writes while the card is still in Plan,
-  refuses to close before Check, and refuses to close without evidence.
+  runs Check in a context that never saw the author's, and refuses to close
+  before Check or without evidence.
 author: emaxgms
 license: MIT
 homepage: https://github.com/emaxgms/manu
 tags: [kanban, process, workflow, quality-gate]
 provides_tools:
   - manu_specify
+  - manu_review
 provides_hooks:
   - pre_llm_call
   - pre_tool_call
