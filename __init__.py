@@ -1,23 +1,34 @@
-"""manu — a four-phase process layer over the Hermes kanban board.
+"""manu — Plan / Do / Check / Close over the Hermes kanban board.
 
-Phases: Plan -> Do -> Check -> Close, with a rework loop back to Plan.
-The phase is NOT stored anywhere new: it IS the card status. This plugin only
-adds the three things Hermes does not already do:
+Hybrid by design, and the split is the point:
 
-  pre_llm_call                 one line of state per turn while a card is open
-                               for this session; zero output when idle.
-  pre_tool_call                refuse to close a card that has no evidence.
-  kanban_task_claimed/_completed
-                               mirror the phase into ``current_step_key`` so the
-                               dashboard shows the same phase we recite.
+  * the `manu` SKILL.md holds the process CONTENT — the four phases, the
+    acceptance-criteria shape, the rework rule, the failure triage. It is read
+    by the model, like BMAD's workflow docs or a Superpowers skill.
+  * THIS PLUGIN holds the four things a skill cannot do: gates on live state.
+    A skill can only ask; a hook can refuse.
 
-Everything else — dispatch, review, rework handoff, PR CI contracts, retry
-budget, escalation back to triage — is core Hermes and is reused untouched.
+Gates, in the order a turn meets them:
+
+  pre_llm_call   PLAN ENTRY. A work-shaped request with no card open gets a
+                 `triage` card created for the session, and one `[manu]` line
+                 injected telling the model to write the criteria, claim, and
+                 build. Quick questions: zero cards, zero text, zero friction.
+                 While a card is open this hook just recites its phase.
+  pre_tool_call  PLAN LOCK: file writes are refused while this session's card
+                 is still in Plan (no criteria written, not claimed).
+                 CHECK: a card cannot be closed before it passed review.
+                 CLOSE: a card cannot be closed without evidence.
+
+The card status IS the phase — nothing new is stored, and everything else
+(dispatch, review handoff, PR CI contracts, retry budget, escalation back to
+triage) is core Hermes, reused untouched.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 import sqlite3
@@ -26,6 +37,8 @@ from typing import Any, Optional, Tuple
 
 # Statuses that mean "a card is live for someone" -> the recitation is on.
 OPEN = ("triage", "todo", "scheduled", "ready", "running", "blocked", "review")
+#: Plan phase: no work may touch files while this session's card sits here.
+PLAN = ("triage", "todo", "scheduled", "ready")
 
 #: status -> phase name printed to the model.
 PHASE = {
@@ -38,12 +51,38 @@ PHASE = {
     "review": "Check",
 }
 
+#: Tools that write to disk. Reads/searches are deliberately never gated.
+ARTIFACTS = ("write_file", "patch")
+
+#: kanban lifecycle events that record a Check pass or a rework handoff.
+_REVIEW_EVENTS = ("review_requested", "changes_requested", "review_reopened")
+
+#: Word stems meaning "this produces an artifact or spans steps" (IT + EN).
+#: ponytail: a word list, not a classifier — swap `looks_like_work` for one
+#: auxiliary call if it keeps misfiring; the seam is that single function.
+WORK_SIGNALS = (
+    "implement", "refactor", "riscr", "rewrit", "build", "crea", "costruisci",
+    "ricerca", "research", "analis", "analy", "report", "document", "script",
+    "migra", "integrat", "automat", "configur", "setup", "set up", "deploy",
+    "progetta", "design", "ottimizz", "optimi", "debug", "sistem", "confronta",
+    "compare", "valuta", "review", "audit", "scriv", "write", "genera",
+    "generate", "make me", "help me", "add ", "aggiungi", "aggiorna", "update",
+    "installa", "pianifica",
+)
+#: A message longer than this is treated as work even without a signal word.
+WORK_MIN_CHARS = 200
+#: A short question is a lookup; it never opens a card.
+QUESTION_MAX_CHARS = 140
+
 #: ``hermes [-p x] kanban complete <ids> ...`` as its own command segment.
 #: ponytail: a heredoc that merely *mentions* the command can trip this; the
 #: block message tells the model how to pass ``--result`` and move on.
 _COMPLETE_CMD = re.compile(
     r"(?:^|[;&|]\s*)(?:\S*/)?hermes(?:\s+[-\w=.:/@]+)*\s+kanban\s+complete\b(?P<rest>[^;&|]*)"
 )
+
+#: Idempotency-key prefix for cards this plugin opens itself.
+_KEY_PREFIX = "manu:"
 
 
 def _db_path(board: Optional[str] = None) -> Path:
@@ -58,6 +97,34 @@ def _read_conn(db=None, board: Optional[str] = None) -> Optional[sqlite3.Connect
     if not path.exists():
         return None
     return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+
+
+def _session_card(
+    session_id: Optional[str], statuses: Tuple[str, ...], db=None, board: Optional[str] = None
+) -> Optional[Tuple[str, str, str]]:
+    """Newest card bound to this session in one of *statuses*, else None.
+
+    Only cards the session itself owns: an unbound card (``hermes kanban
+    create`` writes no session_id) must not unlock or lock another session.
+    """
+    if not session_id:
+        return None
+    conn = None
+    try:
+        conn = _read_conn(db, board)
+        if conn is None:
+            return None
+        row = conn.execute(
+            "select id, title, status from tasks where session_id = ? and status in "
+            f"({','.join('?' * len(statuses))}) order by created_at desc limit 1",
+            (session_id, *statuses),
+        ).fetchone()
+        return (row[0], row[1], row[2]) if row else None
+    except Exception:
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def recite(session_id: Optional[str], db=None, board: Optional[str] = None) -> Optional[str]:
@@ -117,6 +184,143 @@ def _evidence(task_id: str, db=None, board: Optional[str] = None) -> bool:
             conn.close()
 
 
+def _reviewed(task_id: str, db=None, board: Optional[str] = None) -> bool:
+    """True when the card's last Check event was a pass.
+
+    A ``changes_requested`` or ``review_reopened`` after the last
+    ``review_requested`` means the rework loop is open: not reviewed.
+    """
+    conn = None
+    try:
+        conn = _read_conn(db, board)
+        if conn is None:
+            return False
+        row = conn.execute(
+            "select kind from task_events where task_id = ? and kind in "
+            f"({','.join('?' * len(_REVIEW_EVENTS))}) order by id desc limit 1",
+            (task_id, *_REVIEW_EVENTS),
+        ).fetchone()
+        return bool(row and row[0] == "review_requested")
+    except Exception:
+        return False
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def looks_like_work(message: Optional[str]) -> bool:
+    """Cheap a-priori read of the request: deliverable, or chat reply?
+
+    The question the plugin can answer before any action exists — and the one
+    the model cannot answer reliably at that same moment.
+    """
+    text = " ".join((message or "").lower().split())
+    if len(text) < 20:
+        return False
+    if text.endswith("?") and len(text) < QUESTION_MAX_CHARS and not any(
+        s in text for s in WORK_SIGNALS
+    ):
+        return False
+    if any(s in text for s in WORK_SIGNALS):
+        return True
+    return len(text) > WORK_MIN_CHARS
+
+
+def _in_worker() -> bool:
+    """True inside a kanban worker / cron run / delegated child: never re-enter."""
+    return any(
+        os.environ.get(key)
+        for key in ("HERMES_KANBAN_TASK", "HERMES_CRON_SESSION", "HERMES_DELEGATED_CHILD_CONTEXT")
+    )
+
+
+def _default_assignee() -> Optional[str]:
+    """``kanban.default_assignee`` — the value the dispatcher would apply anyway.
+
+    A card created without an assignee is never claimed by dispatch, so the
+    plugin writes the same default the board would show for a hand-made card.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        return ((load_config().get("kanban") or {}).get("default_assignee") or "").strip() or None
+    except Exception:
+        return None
+
+
+def _create_card(session_id: str, message: str, db=None, board: Optional[str] = None) -> Optional[str]:
+    """Open the Plan card for this session; returns its id.
+
+    ``triage`` because the criteria are not written yet — writing them is the
+    Plan step the injected line asks for. ``idempotency_key`` is per session and
+    per request ordinal, so a re-entry in the same session reuses the card
+    instead of stacking duplicates.
+    """
+    from hermes_cli.kanban_db import create_task
+    from hermes_cli.kanban_db_connect import connect
+
+    title = " ".join((message or "").strip().split())[:80] or "untitled request"
+    conn = connect(Path(db) if db is not None else None, board=board)
+    try:
+        key = f"{_KEY_PREFIX}{session_id}:"
+        ordinal = conn.execute(
+            "select count(*) from tasks where idempotency_key like ?", (key + "%",)
+        ).fetchone()[0]
+        return create_task(
+            conn,
+            title=title,
+            body=message,
+            triage=True,
+            assignee=_default_assignee(),
+            session_id=session_id,
+            idempotency_key=f"{key}{ordinal + 1}",
+        )
+    finally:
+        conn.close()
+
+
+_PLAN_HINT = (
+    "Plan first: the acceptance criteria are what Check runs against. Call the "
+    "`manu_specify` tool (or write them into the card body), then "
+    "`hermes kanban claim {task_id}` and retry this write."
+)
+
+
+def _entry_hook(
+    user_message: Optional[str] = None,
+    session_id: Optional[str] = None,
+    _db=None,
+    _create=None,
+    **kwargs,
+) -> Optional[dict]:
+    """pre_llm_call: open the card before the first action, or recite the phase.
+
+    Silent on the fast path: a quick question produces no card and no text.
+    """
+    if not session_id or _in_worker():
+        return None
+    try:
+        if _session_card(session_id, OPEN, db=_db):
+            line = recite(session_id, db=_db)
+            return {"context": line} if line else None
+        if not looks_like_work(user_message):
+            return None
+        task_id = _create(session_id, user_message or "") if _create else _create_card(
+            session_id, user_message or "", db=_db)
+    except Exception:
+        return None
+    if not task_id:
+        return None
+    return {
+        "context": (
+            f"[manu] Plan: card {task_id} opened for this request. Acceptance criteria "
+            f"first — call `manu_specify(task_id=\"{task_id}\")` or write them in the card "
+            f"body — then `hermes kanban claim {task_id}` and build. Close it only with "
+            "evidence, and only after it passed Check."
+        )
+    }
+
+
 def _ids_from_command(command: str) -> Tuple[list, bool]:
     """Task ids named by every ``hermes kanban complete`` in the command, plus
     whether an inline ``--result``/``--summary``/``--metadata`` was supplied.
@@ -152,15 +356,38 @@ def _ids_from_command(command: str) -> Tuple[list, bool]:
     return ids, inline
 
 
-def gate(tool_name: str, args: dict, _lookup=None, **kwargs) -> Optional[dict]:
-    """Refuse to close a card with no evidence attached.
+def gate(
+    tool_name: str,
+    args: dict,
+    _lookup=None,
+    _plan_lookup=None,
+    _reviewed_lookup=None,
+    session_id: Optional[str] = None,
+    _db=None,
+    **kwargs,
+) -> Optional[dict]:
+    """The three pre_tool_call refusals: Plan lock, Check, Close.
 
-    Covers the two paths that can close a card in v1: the ``kanban_complete``
-    tool (dispatcher workers) and ``hermes kanban complete`` typed by the agent
-    (in-session work, where dispatch is off). ponytail: presence check only —
-    evidence *quality* is the reviewer's job, and a human running the CLI from
-    their own shell bypasses this on purpose.
+    ``_db`` is the single injection seam: the default lookups read the same
+    board the entry hook wrote to. ponytail: presence checks only — evidence
+    *quality* and criteria quality are the reviewer's job, and a human running
+    the CLI from their own shell bypasses this on purpose.
     """
+    if tool_name in ARTIFACTS:
+        if not session_id:
+            return None
+        plan = _plan_lookup(session_id) if _plan_lookup else _session_card(session_id, PLAN, db=_db)
+        if not plan:
+            return None
+        task_id, title = plan[0], plan[1]
+        return {
+            "action": "block",
+            "message": (
+                f'manu: card {task_id} "{title}" is in Plan. '
+                + _PLAN_HINT.format(task_id=task_id)
+            ),
+        }
+
     ids: list = []
     inline = False
     if tool_name == "kanban_complete":
@@ -171,9 +398,24 @@ def gate(tool_name: str, args: dict, _lookup=None, **kwargs) -> Optional[dict]:
         command = args.get("command") or ""
         if isinstance(command, str) and "kanban complete" in command:
             ids, inline = _ids_from_command(command)
-    if not ids or inline:
+    if not ids:
         return None
-    lookup = _lookup or _evidence
+
+    reviewed = _reviewed_lookup or (lambda tid: _reviewed(tid, db=_db))
+    unreviewed = [t for t in ids if not reviewed(t)]
+    if unreviewed:
+        return {
+            "action": "block",
+            "message": (
+                f"manu: card(s) {', '.join(unreviewed)} have not passed Check. Record the "
+                "review first — `hermes kanban request-review <id> --summary \"what was "
+                "built + what was verified\"` — then close."
+            ),
+        }
+
+    if inline:
+        return None
+    lookup = _lookup or (lambda tid: _evidence(tid, db=_db))
     missing = [t for t in ids if not lookup(t)]
     if not missing:
         return None
@@ -187,47 +429,15 @@ def gate(tool_name: str, args: dict, _lookup=None, **kwargs) -> Optional[dict]:
     }
 
 
-def _set_step(task_id: Optional[str], step: Optional[str], board: Optional[str] = None) -> None:
-    """Mirror the phase into the native reserved column.
-
-    ponytail: informational only — the status stays the source of truth and v1
-    routing ignores ``current_step_key``. Inert until the dispatcher runs
-    (``kanban.dispatch_in_gateway: true``), since these hooks fire in the
-    dispatcher/worker processes.
-    """
-    if not task_id:
-        return
-    try:
-        # Import from the defining module: the ``kanban_db`` facade re-exports
-        # these only through the Sep-2026 plugin-compat layer, which the plugin
-        # loader refuses (``hermes plugins doctor``).
-        from hermes_cli.kanban_db_connect import connect, write_txn
-
-        conn = connect(board=board)
-        try:
-            with write_txn(conn):
-                conn.execute(
-                    "update tasks set current_step_key = ? where id = ?", (step, task_id)
-                )
-        finally:
-            conn.close()
-    except Exception:
-        pass
-
-
-def _recite_hook(session_id: Optional[str] = None, **kwargs) -> Optional[dict]:
-    line = recite(session_id)
-    return {"context": line} if line else None
-
-
 _SPECIFY_SCHEMA = {
     "name": "manu_specify",
     "description": (
-        "Plan step for a vague card: ask the auxiliary specifier for Goal / Approach / Acceptance "
-        "criteria / Out of scope, retitle the card and promote it out of `triage`. Returns JSON. "
-        "Use this instead of the `hermes kanban specify` CLI: that command runs in its own process "
-        "with no conversation context, so a relay provider that needs a session header (OpenCode) "
-        "answers HTTP 400 MissingSessionID. This runs the same specifier in-process."
+        "Plan step: turn the open card into Goal / Approach / Acceptance criteria / Out of "
+        "scope, retitle it and promote it out of `triage`. Run it before claiming the card — "
+        "the criteria it writes are what Check verifies against. Returns JSON. Use this "
+        "instead of the `hermes kanban specify` CLI: that command runs in its own process "
+        "with no conversation context, so a relay provider that needs a session header "
+        "(OpenCode) answers HTTP 400 MissingSessionID. This runs the same specifier in-process."
     ),
     "parameters": {
         "type": "object",
@@ -268,23 +478,13 @@ def _specify_handler(args: dict, **kwargs) -> str:
     return json.dumps(specify((args or {}).get("task_id")))
 
 
-def _on_claimed(task_id: Optional[str] = None, board: Optional[str] = None, **kwargs) -> None:
-    _set_step(task_id, "Do", board=board)
-
-
-def _on_completed(task_id: Optional[str] = None, board: Optional[str] = None, **kwargs) -> None:
-    _set_step(task_id, None, board=board)
-
-
 def register(ctx: Any) -> None:
-    ctx.register_hook("pre_llm_call", _recite_hook)
+    ctx.register_hook("pre_llm_call", _entry_hook)
     ctx.register_hook("pre_tool_call", gate)
-    ctx.register_hook("kanban_task_claimed", _on_claimed)
-    ctx.register_hook("kanban_task_completed", _on_completed)
     ctx.register_tool(
         name="manu_specify",
         toolset="manu",
         schema=_SPECIFY_SCHEMA,
         handler=_specify_handler,
-        description="Specify a triage card in-process (Plan phase)",
+        description="Write the acceptance criteria of a triage card in-process (Plan phase)",
     )

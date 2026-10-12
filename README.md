@@ -8,12 +8,13 @@
   <img src="https://img.shields.io/badge/dependencies-none-111111?style=flat-square" alt="No dependencies">
 </p>
 
-**manu is a process layer for [Hermes Agent](https://github.com/NousResearch/hermes-agent).** It puts
-multi-step work on a kanban card, keeps the four phases of that work in front of the agent every turn,
-and refuses to let the card close until there is something to show for it.
+**manu is a process layer for [Hermes Agent](https://github.com/NousResearch/hermes-agent).** It opens a
+kanban card for work-shaped requests, refuses file writes while that card is still in Plan, keeps the
+four phases of that work in front of the agent every turn, and refuses to close the card before Check and
+without something to show for it.
 
-Small enough to read in one sitting: one Python file, ~290 lines, four hooks and one tool. No daemon,
-no database of its own, no UI.
+The skill carries the process *content*; the plugin carries the *gates* — a skill can only ask, a hook
+can refuse. One Python file, ~420 lines, two hooks and one tool. No daemon, no database of its own, no UI.
 
 ---
 
@@ -39,6 +40,9 @@ on the card, and closure is gated on evidence.
 
 | | |
 |---|---|
+| **An entry gate** | A work-shaped request with no card open gets one created **by the plugin** — in `triage`, bound to the session, your message as the body — plus one line naming the Plan step. A quick question gets no card and no text. |
+| **A Plan lock** | `write_file` / `patch` are refused while this session's own card is still in `triage`/`todo`/`ready`: criteria first, then `claim`. Reads, searches and terminal are never gated. |
+| **A check gate** | `complete` is refused unless the card's latest review event is a `review_requested` — a `changes_requested` after it re-opens the loop. Check is a transition, not a promise. |
 | **Four phases on a card** | Plan → Do → Check → Close. The phase *is* the card status (`running` = Do, `review` = Check), so nothing is stored twice and nothing drifts. |
 | **A per-turn recitation** | While a card is open, every turn carries exactly one line: `[manu] card #t_ab12 "Compare LoRa stacks" — phase Do. Close it only with evidence.` When no card is open, nothing is injected — quick questions pay nothing. |
 | **An evidence gate** | `hermes kanban complete` and the `kanban_complete` tool are refused unless the card carries a result or an attachment. The refusal says what to attach. |
@@ -114,20 +118,21 @@ hermes kanban complete t_ab12 --result "report.md; 7 sources cited"
 ## How it works
 
 Hermes already owns dispatch, review handoff, PR CI contracts, the retry budget and the escalation back
-to triage. manu adds only the three pieces that were missing, through the documented plugin surface:
+to triage. manu adds only the gates that were missing, through the documented plugin surface:
 
 | Piece | Hook | Effect |
 |---|---|---|
-| Recitation | `pre_llm_call` | one line per turn while a card is open; nothing when idle |
+| Entry + recitation | `pre_llm_call` | opens the Plan card for a work-shaped request, or recites the phase of the open one; nothing when idle |
+| Plan lock | `pre_tool_call` | vetoes `write_file` / `patch` while this session's card is still in Plan |
+| Check | `pre_tool_call` | vetoes `complete` until a `review_requested` event exists on the card |
 | Evidence gate | `pre_tool_call` | vetoes `kanban_complete` and agent-typed `hermes kanban complete` without evidence |
-| Phase mirror | `kanban_task_claimed` / `_completed` | writes `current_step_key` so the dashboard shows the same phase (informational) |
 | Plan step | tool `manu_specify` | runs the auxiliary specifier **in-process** and promotes the card |
 
 ```text
 ~/.hermes/plugins/manu/
-├── plugin.yaml      # manifest: 1 tool, 4 hooks
+├── plugin.yaml      # manifest: 1 tool, 2 hooks
 ├── __init__.py      # the whole plugin
-├── test_manu.py     # 17 tests: recitation, gate on both paths, evidence lookup, tool mapping
+├── test_manu.py     # 30 tests: entry classifier, Plan lock, Check, evidence, recitation, tool mapping
 └── skill/SKILL.md   # the process skill (traffic light, phases, failure triage, recipes)
 ```
 
@@ -137,6 +142,11 @@ Honest ceilings, so you can decide whether they matter for you:
 
 - **The gate checks presence, not quality.** An attached file proves *something* was produced; whether
   it is good is the reviewer's job.
+- **The entry classifier is a word list, not a model call.** A work-shaped request it misses gets no
+  card; a quick question it over-reads leaves one orphan `triage` card to archive. Swapping that one
+  function for an auxiliary call is the upgrade path.
+- **The Plan lock covers `write_file`/`patch`, not `terminal`.** A write routed through a heredoc is the
+  documented bypass — deliberate, so arithmetic and quick shell work never pay for the process.
 - **A human closing a card from their own shell is not intercepted.** `pre_tool_call` sees the agent's
   tool calls, not your terminal.
 - **The recitation binds on the card's session.** Cards created from a session carry its id; cards
