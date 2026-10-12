@@ -10,13 +10,16 @@ import sys
 from pathlib import Path
 
 _PLUGIN = Path(__file__).parent / "__init__.py"
+# The plugin imports core modules (hermes_cli.kanban_db*) on the real create path;
+# at runtime that tree is always importable, under pytest it must be added by hand.
+sys.path.insert(0, str(Path.home() / ".hermes" / "hermes-agent"))
 _spec = importlib.util.spec_from_file_location("manu_plugin", _PLUGIN)
 manu = importlib.util.module_from_spec(_spec)
 sys.modules["manu_plugin"] = manu
 _spec.loader.exec_module(manu)
 
 
-def _fake_db(tmp, session="s1", status="running", attachments=0, result=None):
+def _fake_db(tmp, session="s1", status="running", attachments=0, result=None, events=()):
     tmp = Path(tmp)
     tmp.mkdir(parents=True, exist_ok=True)
     path = tmp / "kanban.db"
@@ -27,10 +30,15 @@ def _fake_db(tmp, session="s1", status="running", attachments=0, result=None):
     )
     con.execute("create table task_attachments (id integer primary key, task_id text)")
     con.execute(
+        "create table task_events (id integer primary key, task_id text, kind text)"
+    )
+    con.execute(
         "insert into tasks values ('1','Report X',?,?,1,?)", (status, session, result)
     )
     for _ in range(attachments):
         con.execute("insert into task_attachments (task_id) values ('1')")
+    for kind in events:
+        con.execute("insert into task_events (task_id, kind) values ('1', ?)", (kind,))
     con.commit()
     con.close()
     return path
@@ -68,27 +76,163 @@ def test_recite_ignores_closed_card(tmp_path):
     assert manu.recite("s1", db=db) is None
 
 
-# --- evidence gate --------------------------------------------------------
+# --- plan entry (the gate that used to be prose) --------------------------
+
+
+def test_looks_like_work_detects_real_requests():
+    assert manu.looks_like_work(
+        "make me a research on whats the best browser for windows for me, im using chrome"
+    )
+    assert manu.looks_like_work(
+        "possiamo fare una adversarial review e scrivere dei file .md piu efficienti ?"
+    )
+    assert manu.looks_like_work("scrivi un report sul confronto tra i tre stack LoRa e salvalo")
+    assert manu.looks_like_work("x" * 250)
+
+
+def test_looks_like_work_ignores_quick_questions():
+    assert not manu.looks_like_work("che ore sono?")
+    assert not manu.looks_like_work("what's the weather in Cagliari?")
+    assert not manu.looks_like_work("how do I list the kanban cards?")
+    assert not manu.looks_like_work("")
+    assert not manu.looks_like_work(None)
+
+
+def test_entry_opens_a_card_before_the_first_action(tmp_path):
+    db = _fake_db(tmp_path, session="other")  # nothing open for this session
+    made = []
+
+    def _create(session_id, message):
+        made.append((session_id, message))
+        return "t_9"
+
+    out = manu._entry_hook(
+        user_message="scrivi un report sul confronto tra i tre stack LoRa", session_id="s1",
+        _db=db, _create=_create,
+    )
+    assert made == [("s1", "scrivi un report sul confronto tra i tre stack LoRa")], made
+    assert out and "t_9" in out["context"] and "manu_specify" in out["context"], out
+
+
+def test_entry_recites_instead_of_opening_a_second_card(tmp_path):
+    db = _fake_db(tmp_path, status="running")  # a card of this session is open
+    out = manu._entry_hook(
+        user_message="scrivi un report su tutto", session_id="s1", _db=db,
+        _create=lambda *a: (_ for _ in ()).throw(AssertionError("must not create")),
+    )
+    assert out and "Report X" in out["context"], out
+
+
+def test_entry_is_silent_on_the_fast_path(tmp_path):
+    db = _fake_db(tmp_path, session="other")
+    assert manu._entry_hook(user_message="che ore sono?", session_id="s1", _db=db,
+                            _create=lambda *a: "nope") is None
+
+
+def test_entry_uses_the_injected_board_for_the_card_it_opens(tmp_path):
+    """The default creator must write where the hook read (`_db`), not to the live board."""
+    board = tmp_path / "kanban.db"  # no file yet: the core connect() builds the real schema
+    out = manu._entry_hook(
+        user_message="scrivi un report sul confronto tra i tre stack LoRa", session_id="s1", _db=board,
+    )
+    assert out and "[manu] Plan: card" in out["context"], out
+    con = sqlite3.connect(board)
+    rows = con.execute("select id, status, session_id, assignee from tasks").fetchall()
+    con.close()
+    assert rows and rows[0][1] == "triage" and rows[0][2] == "s1", rows
+    assert rows[0][3] == manu._default_assignee(), rows  # 'kanban.default_assignee', not NULL
+
+
+def test_default_assignee_reads_the_kanban_config():
+    from hermes_cli.config import load_config
+
+    expected = ((load_config().get("kanban") or {}).get("default_assignee") or "").strip() or None
+    assert manu._default_assignee() == expected
+
+
+def test_entry_never_reenters_worker_or_child(tmp_path, monkeypatch):
+    db = _fake_db(tmp_path, session="other")
+    for key in ("HERMES_KANBAN_TASK", "HERMES_CRON_SESSION", "HERMES_DELEGATED_CHILD_CONTEXT"):
+        monkeypatch.setenv(key, "1")
+        assert manu._entry_hook(user_message="scrivi un report completo", session_id="s1",
+                                _db=db, _create=lambda *a: "nope") is None
+        monkeypatch.delenv(key)
+
+
+# --- plan lock, check, close ---------------------------------------------
+
+
+def test_plan_lock_blocks_writes_until_the_card_is_claimed():
+    reason = manu.gate(
+        "write_file", {"path": "/tmp/x.md"}, session_id="s1",
+        _plan_lookup=lambda sid: ("7", "Report X", "triage"),
+    )
+    assert reason and reason["action"] == "block", reason
+    assert "7" in reason["message"] and "manu_specify" in reason["message"], reason
+    # no card in Plan, or a read/other tool -> untouched
+    assert manu.gate("write_file", {"path": "x"}, session_id="s1",
+                     _plan_lookup=lambda sid: None) is None
+    assert manu.gate("read_file", {"path": "x"}, session_id="s1",
+                     _plan_lookup=lambda sid: ("7", "Report X", "triage")) is None
+
+
+def test_plan_lock_ignores_other_sessions(tmp_path):
+    db = _fake_db(tmp_path, status="triage")  # the card belongs to s1
+    assert manu._session_card("s2", manu.PLAN, db=db) is None
+    assert manu._session_card("s1", manu.PLAN, db=db)[0] == "1"
+
+
+def test_gate_blocks_close_before_check():
+    reason = manu.gate(
+        "kanban_complete", {"task_ids": ["1"], "result": "looks done"},
+        _reviewed_lookup=lambda t: False,
+    )
+    assert reason and "not passed Check" in reason["message"], reason
+    assert manu.gate(
+        "kanban_complete", {"task_ids": ["1"], "result": "verified"},
+        _reviewed_lookup=lambda t: True,
+    ) is None
+
+
+def test_reviewed_reads_the_event_log(tmp_path):
+    assert manu._reviewed("1", db=_fake_db(tmp_path / "a", events=["review_requested"])) is True
+    assert manu._reviewed("1", db=_fake_db(tmp_path / "b", events=["changes_requested"])) is False
+    # a rework after a pass re-opens the loop
+    assert manu._reviewed(
+        "1", db=_fake_db(tmp_path / "c", events=["review_requested", "changes_requested"])
+    ) is False
+    assert manu._reviewed("1", db=_fake_db(tmp_path / "d")) is False
+
+
+def test_gate_blocks_cli_close_before_check():
+    reason = manu.gate(
+        "terminal", {"command": "hermes kanban complete 7 --result 'tests: green'"},
+        _reviewed_lookup=lambda t: False,
+    )
+    assert reason and "not passed Check" in reason["message"], reason
+
+
+# --- close: evidence ------------------------------------------------------
 
 
 def test_gate_blocks_empty_close():
-    reason = manu.gate("kanban_complete", {"task_ids": ["1"]}, _lookup=lambda tid: False)
+    reason = manu.gate("kanban_complete", {"task_ids": ["1"]}, _reviewed_lookup=lambda t: True,
+                       _lookup=lambda tid: False)
     assert reason and reason["action"] == "block", reason
     assert "1" in reason["message"]
 
 
 def test_gate_allows_evidenced_close():
-    assert (
-        manu.gate(
-            "kanban_complete", {"task_ids": ["1"], "result": "gate: green"}, _lookup=lambda t: False
-        )
-        is None
-    )
-    assert manu.gate("kanban_complete", {"task_ids": ["1"]}, _lookup=lambda t: True) is None
+    assert manu.gate(
+        "kanban_complete", {"task_ids": ["1"], "result": "gate: green"},
+        _reviewed_lookup=lambda t: True, _lookup=lambda t: False,
+    ) is None
+    assert manu.gate("kanban_complete", {"task_ids": ["1"]},
+                     _reviewed_lookup=lambda t: True, _lookup=lambda t: True) is None
 
 
 def test_gate_ignores_other_tools():
-    assert manu.gate("write_file", {"path": "x"}, _lookup=lambda t: False) is None
+    assert manu.gate("read_file", {"path": "x"}, _lookup=lambda t: False) is None
     assert manu.gate("terminal", {"command": "hermes kanban list"}, _lookup=lambda t: False) is None
 
 
@@ -96,21 +240,17 @@ def test_gate_blocks_cli_close_without_evidence():
     reason = manu.gate(
         "terminal",
         {"command": "cd ~ && hermes -p default kanban complete 7 && echo ok"},
-        _lookup=lambda t: False,
+        _reviewed_lookup=lambda t: True, _lookup=lambda t: False,
     )
     assert reason and reason["action"] == "block", reason
     assert "7" in reason["message"]
 
 
 def test_gate_allows_cli_close_with_result():
-    assert (
-        manu.gate(
-            "terminal",
-            {"command": 'hermes kanban complete 7 --result "tests: 12 passed"'},
-            _lookup=lambda t: False,
-        )
-        is None
-    )
+    assert manu.gate(
+        "terminal", {"command": 'hermes kanban complete 7 --result "tests: 12 passed"'},
+        _reviewed_lookup=lambda t: True, _lookup=lambda t: False,
+    ) is None
 
 
 def test_gate_ignores_punctuation_around_ids():
@@ -173,8 +313,7 @@ def test_register_wires_hooks_and_tool():
             seen["tools"].append(kw["name"])
 
     manu.register(_Ctx())
-    assert seen["hooks"] == ["pre_llm_call", "pre_tool_call",
-                             "kanban_task_claimed", "kanban_task_completed"], seen
+    assert seen["hooks"] == ["pre_llm_call", "pre_tool_call"], seen
     assert seen["tools"] == ["manu_specify"], seen
 
 
@@ -184,3 +323,4 @@ def test_register_wires_hooks_and_tool():
 def test_phase_map_covers_every_open_status():
     assert set(manu.PHASE) == set(manu.OPEN)
     assert manu.PHASE["running"] == "Do" and manu.PHASE["review"] == "Check"
+    assert set(manu.PLAN) < set(manu.OPEN) and "running" not in manu.PLAN
