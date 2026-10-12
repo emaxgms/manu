@@ -74,6 +74,12 @@ WORK_MIN_CHARS = 200
 #: A short question is a lookup; it never opens a card.
 QUESTION_MAX_CHARS = 140
 
+#: Gateway-generated text that arrives in the user role but is never a user
+#: request: delegation results and system notices. Without this the gate opens a
+#: card for a message nobody sent (observed 3x on 2026-10-12).
+#: ponytail: marker list; extend it if a new internal sender appears.
+_INTERNAL_MARKERS = ("[internal notification", "[async delegation batch complete")
+
 #: ``hermes [-p x] kanban complete <ids> ...`` as its own command segment.
 #: ponytail: a heredoc that merely *mentions* the command can trip this; the
 #: block message tells the model how to pass ``--result`` and move on.
@@ -216,6 +222,8 @@ def looks_like_work(message: Optional[str]) -> bool:
     """
     text = " ".join((message or "").lower().split())
     if len(text) < 20:
+        return False
+    if any(marker in text for marker in _INTERNAL_MARKERS):
         return False
     if text.endswith("?") and len(text) < QUESTION_MAX_CHARS and not any(
         s in text for s in WORK_SIGNALS
