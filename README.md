@@ -93,6 +93,9 @@ Restart the gateway (or open a new CLI session) so the hooks load.
 
 ## Use it
 
+The agent runs these commands for you — you talk, it drives the board. The CLI is shown so you can
+follow (or take over) what happened.
+
 ```bash
 # a concrete request: write the acceptance criteria yourself, start in todo
 hermes kanban create "Compare EU LoRa mesh stacks" --assignee default \
@@ -140,8 +143,8 @@ Honest ceilings, so you can decide whether they matter for you:
   created by the bare CLI are unbound and are recited by whichever session is active.
 - **One profile means the reviewer shares the author's model.** Use `hermes kanban set-model <id>` for
   a genuinely different verifier; a different *profile* is only worth it for a different toolset.
-- **Phase bookkeeping is inert until the dispatcher runs** (`kanban.dispatch_in_gateway: true`) — with
-  dispatch off, work happens in-session and the status is the only state that matters.
+- **Phase bookkeeping needs a claim.** `current_step_key` is written when the card is claimed
+  (`hermes kanban claim <id>`), so it stays empty on a card nobody has started.
 
 ## Requirements
 

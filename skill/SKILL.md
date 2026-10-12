@@ -39,6 +39,8 @@ budget, escalation) is core Hermes, reused untouched.
 | Step mirror | `current_step_key` | informational; v1 routing ignores it. Inert while `kanban.dispatch_in_gateway: false` (those hooks fire in dispatcher/worker processes) |
 | Tests | `~/.hermes/hermes-agent/venv/bin/python -m pytest ~/.hermes/plugins/manu/test_manu.py -q` | 17 tests: recitation, gate on both paths, evidence lookup, `manu_specify` mapping, hook/tool wiring |
 
+- **Who types:** the agent runs every `hermes kanban ...` command in-session; the user talks and
+  answers questions. The user types a command only if they choose to take over the board by hand.
 - **Card ↔ session binding:** a card created from a session inherits `HERMES_SESSION_ID`, and only then
   is it recited. Cards created from the dashboard or a plain shell have `session_id = NULL` → no
   recitation; work them explicitly with `hermes kanban list` / `show <id>`.
@@ -60,7 +62,7 @@ budget, escalation) is core Hermes, reused untouched.
 | Phase | Status | Rule |
 |---|---|---|
 | **Plan** | `triage` → `specify` → `todo` → `ready` | **asking happens here.** Write the acceptance criteria before any build starts — Check tests against exactly those |
-| **Do** | `running` | **no questions here.** If something is genuinely missing, `block` the card and say what is missing instead of guessing |
+| **Do** | `running` | starts with `hermes kanban claim <id>` (that is what turns the recited phase into "Do" and fires the step mirror). **No questions here:** if something is genuinely missing, `block` the card and say what is missing instead of guessing |
 | **Check** | `review` | verify against the criteria written in Plan; PR cards cannot close until required CI passes |
 | **Close** | `done` → `archived` | only with evidence attached |
 
@@ -106,7 +108,7 @@ hermes kanban create "open PR for token store" --assignee default --parent <pare
   --completion-contract owner/repo
 
 # phase moves
-hermes kanban claim <id>                 # Do (in-session: just work it; claim is for workers)
+hermes kanban claim <id>                 # Do starts here: ready -> running, phase becomes "Do"
 hermes kanban request-review <id> --summary "what was built + what was verified"
 hermes kanban complete <id> --result "pytest -q -> 12 passed; report at /home/ema/report.md"
 hermes kanban attach <id> <file>         # evidence alternative to --result
