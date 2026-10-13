@@ -57,6 +57,65 @@ ARTIFACTS = ("write_file", "patch")
 #: kanban lifecycle events that record a Check pass or a rework handoff.
 _REVIEW_EVENTS = ("review_requested", "changes_requested", "review_reopened")
 
+#: status -> the skills the injected line names for that phase. A name here is a
+#: REMINDER the model still has to act on; only a dispatcher-spawned worker is
+#: force-loaded, via `--skills` from the card's own `tasks.skills` column.
+PHASE_SKILLS = {
+    "triage": ("grill-me",),
+    "todo": ("grill-me", "plan"),
+    "scheduled": ("grill-me", "plan"),
+    "ready": ("plan",),
+    "running": ("test-driven-development", "ad-hoc-verification"),
+    "review": ("requesting-code-review",),
+    "blocked": (),
+}
+
+# --- prompt texts ----------------------------------------------------------
+# Every text manu injects or sends to a model lives in prompts/<name>.md and is
+# read at call time: editing the wording is an edit to a .md, never to this file,
+# and takes effect on the next call without restarting a host. A file that is
+# missing or unparseable degrades (hook goes quiet, gate still refuses) and never
+# raises into the turn it is attached to.
+_PROMPT_DIR = Path(__file__).with_name("prompts")
+_PROMPT_FALLBACK = {
+    "plan_lock": "manu: refused — this card is in Plan (see prompts/ in the manu plugin).",
+    "close_check": "manu: refused — this card has not passed Check (see prompts/).",
+    "close_evidence": "manu: refused — this card has no evidence (see prompts/).",
+}
+
+
+class _KeepUnknown(dict):
+    """Leaves an unknown ``{placeholder}`` in place instead of raising KeyError."""
+
+    def __missing__(self, key):
+        return "{" + key + "}"
+
+
+def prompt_text(name: str, **fields) -> str:
+    """Render ``prompts/<name>.md``, or the built-in one-liner for a gate refusal.
+
+    ponytail: read per call, no cache — the files are a few hundred bytes each and
+    a cached copy would reintroduce the restart that moving them out of code removed.
+    """
+    try:
+        raw = (_PROMPT_DIR / f"{name}.md").read_text("utf-8").strip()
+    except OSError:
+        raw = ""
+    if not raw:
+        return _PROMPT_FALLBACK.get(name, "")
+    if not fields:  # a prompt with literal JSON braces is never formatted
+        return raw
+    try:
+        return raw.format_map(_KeepUnknown(fields))
+    except (ValueError, IndexError):
+        return raw
+
+
+def _skill_hint(status: Optional[str]) -> str:
+    """`` Skills: a, b.`` for the phase, or '' when the phase names no skill."""
+    names = PHASE_SKILLS.get(status or "", ())
+    return f" Skills: {', '.join(names)}." if names else ""
+
 #: Word stems meaning "this produces an artifact or spans steps" (IT + EN), matched
 #: at a word start so "preview" is not "review" and "generative" is not "genera".
 #: Measured against 45 real requests (`docs/entry-classifier.md`): 73% -> 96%
@@ -68,25 +127,33 @@ _REVIEW_EVENTS = ("review_requested", "changes_requested", "review_reopened")
 #: that single function.
 WORK_SIGNALS = (
     "implement", "refactor", "riscr", "rewrit", "crea", "costruisci", "ricerca", "research",
-    "analis", "analizz", "report", "document", "script", "migra", "integrat", "automat",
-    "configur", "deploy", "progetta", "design", "ottimizz", "optimi", "debug", "sistem",
+    "analis", "analizz", "analys", "analyz", "report", "document", "script", "migra", "integrat",
+    "automat", "configur", "deploy", "progetta", "design", "ottimizz", "optimi", "debug", "sistem",
     "confronta", "compare", "valuta", "review", "audit", "scriv", "write", "make me",
-    "help me", "add ", "aggiungi", "aggiorna", "update", "installa", "pianifica",
-    "modific", "togli", "rimuov", "elimina", "cancella", "pulir", "pulisc", "miglior",
-    "improve", "fix", "salva", "save", "check", "verifica", "controlla", "esegui", "lancia",
-    "riassumi", "summarize", "traduci", "spiega", "explain",
+    "help me", "add ", "aggiungi", "aggiorna", "update", "install", "pianifica",
+    "modific", "togli", "remov", "rimuov", "delet", "elimina", "cancella", "pulir", "pulisc",
+    "miglior", "improve", "fix", "salva", "save", "check", "verif", "controlla", "esegui",
+    "lancia", "riassumi", "summarize", "traduci", "translat", "spiega", "explain",
 )
-#: The subset that counts *anywhere*, including inside a question: an explicit ask
-#: ("puoi verificare cosa abbiamo fatto?") is work even when it is phrased as one.
+#: Explicit asks: imperative forms, not bare verbs. They count anywhere in the message,
+#: including inside a question ("fai un review e cerchiamo di capire …?"). Bare English
+#: verbs are deliberately absent — "create"/"write"/"review" are the same word in a
+#: wh-question ("why did no card get created?"), and that opened cards nobody asked for.
 ASK_SIGNALS = (
-    "fai ", "fammi", "make me", "crea", "creami", "create", "scrivi", "scrivere", "scrivimi",
-    "write", "riscrivi", "aggiungi", "add ", "installa", "aggiorna", "update", "migra",
-    "progetta", "pianifica", "ottimizza", "debug", "configura", "deploy", "automatizza",
-    "documenta", "analizza", "analyze", "verifica", "controlla", "valuta", "valutiam",
-    "confronta", "compare", "review", "audit", "ricerca", "ricerchiamo", "research", "report",
-    "lancia", "esegui", "fix", "sistema", "modifica", "migliora", "togli", "rimuovi",
-    "elimina", "pulir", "pulisc", "traduci", "riassumi", "summarize", "spiegami", "spiega",
+    "fai ", "fammi", "make me", "crea ", "creami", "scrivi", "scrivere", "scrivimi", "riscrivi",
+    "aggiungi", "installa", "aggiorna", "migra", "progetta", "pianifica", "ottimizza", "configura",
+    "automatizza", "documenta", "analizza", "verifica", "controlla", "valuta", "valutiam",
+    "confronta", "ricerca", "ricerchiamo", "lancia", "esegui", "sistema", "modifica", "migliora",
+    "togli", "rimuovi", "elimina", "pulir", "pulisc", "traduci", "riassumi", "spiegami", "spiega",
 )
+#: Phrases that turn a question into a request, so its work stems count: "puoi verificare
+#: cosa abbiamo fatto?", "can you check the logs?", "possiamo fare una review?". A wh-question
+#: has no opener and stays a question ("how does the gate decide to refuse a write?").
+REQUEST_OPENERS = (
+    "puoi", "potresti", "possiamo", "mi fai", "mi dai", "fammi", "per favore", "per piacere",
+    "please", "can you", "could you", "would you", "will you",
+)
+
 #: A message shorter than this is a reflex reply, never a request.
 WORK_MIN_CHARS = 20
 
@@ -98,6 +165,7 @@ def _signal_re(stems) -> re.Pattern:
 
 _SIGNAL_RE = _signal_re(WORK_SIGNALS)
 _ASK_RE = _signal_re(ASK_SIGNALS)
+_OPENER_RE = _signal_re(REQUEST_OPENERS)
 #: Sentence boundaries: a stem inside a question sentence is not an instruction.
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+|\n+")
 
@@ -190,9 +258,12 @@ def recite(session_id: Optional[str], db=None, board: Optional[str] = None) -> O
     if not row:
         return None
     task_id, title, status = row
-    return (
-        f'[manu] card #{task_id} "{title}" — phase {PHASE.get(status, status)}. '
-        "Close it only with evidence."
+    return prompt_text(
+        "recite",
+        task_id=task_id,
+        title=title,
+        phase=PHASE.get(status, status),
+        skill_hint=_skill_hint(status),
     )
 
 
@@ -241,6 +312,16 @@ def _reviewed(task_id: str, db=None, board: Optional[str] = None) -> bool:
             conn.close()
 
 
+def _instruction(sentence: str) -> bool:
+    """Is this sentence an instruction, or a question *about* one?
+
+    A question is an ask only when it carries a request opener ("puoi verificare …?",
+    "can you check …?"). A wh-question is a question even with a work stem inside it —
+    "how does the gate decide to refuse a write?" asks, it does not instruct.
+    """
+    return not sentence.rstrip().endswith("?") or bool(_OPENER_RE.search(sentence))
+
+
 def looks_like_work(message: Optional[str]) -> bool:
     """Cheap a-priori read of the request: deliverable, or chat reply?
 
@@ -250,9 +331,12 @@ def looks_like_work(message: Optional[str]) -> bool:
     Three rules, in order, and the measurement behind them is in
     ``docs/entry-classifier.md``:
 
-    1. an explicit ask ("fammi", "puoi verificare?") is work even inside a question;
-    2. a work stem inside a **question sentence** is not an instruction — that is
-       what separated the real requests from the rants in the labelled corpus;
+    1. an explicit ask ("fammi", "puoi verificare", "can you check") is work
+       wherever it appears, question or not;
+    2. a bare work stem counts only in an **instruction sentence** — a statement, or a
+       question carrying a request opener. A wh-question has neither, so the stems in it
+       ("why did no card get created?", "how does the gate decide to refuse a write?")
+       decide nothing;
     3. length decides nothing. A long question is still a question.
     """
     text = " ".join((message or "").lower().split())
@@ -262,11 +346,8 @@ def looks_like_work(message: Optional[str]) -> bool:
         return False
     if _ASK_RE.search(text):
         return True
-    return any(
-        _SIGNAL_RE.search(sentence)
-        for sentence in _SENTENCE_RE.split(text)
-        if not sentence.rstrip().endswith("?")
-    )
+    statements = [s for s in _SENTENCE_RE.split(text) if _instruction(s)]
+    return any(_SIGNAL_RE.search(s) for s in statements)
 
 
 def _in_worker() -> bool:
@@ -322,13 +403,6 @@ def _create_card(session_id: str, message: str, db=None, board: Optional[str] = 
         conn.close()
 
 
-_PLAN_HINT = (
-    "Plan first: the acceptance criteria are what Check runs against. Call the "
-    "`manu_specify` tool (or write them into the card body), then "
-    "`hermes kanban claim {task_id}` and retry this write."
-)
-
-
 def _entry_hook(
     user_message: Optional[str] = None,
     session_id: Optional[str] = None,
@@ -355,12 +429,7 @@ def _entry_hook(
     if not task_id:
         return None
     return {
-        "context": (
-            f"[manu] Plan: card {task_id} opened for this request. Acceptance criteria "
-            f"first — call `manu_specify(task_id=\"{task_id}\")` or write them in the card "
-            f"body — then `hermes kanban claim {task_id}` and build. Close it only with "
-            "evidence, and only after it passed Check."
-        )
+        "context": prompt_text("entry_plan", task_id=task_id, skill_hint=_skill_hint("triage"))
     }
 
 
@@ -425,9 +494,8 @@ def gate(
         task_id, title = plan[0], plan[1]
         return {
             "action": "block",
-            "message": (
-                f'manu: card {task_id} "{title}" is in Plan. '
-                + _PLAN_HINT.format(task_id=task_id)
+            "message": prompt_text(
+                "plan_lock", task_id=task_id, title=title, skill_hint=_skill_hint(plan[2])
             ),
         }
 
@@ -449,11 +517,7 @@ def gate(
     if unreviewed:
         return {
             "action": "block",
-            "message": (
-                f"manu: card(s) {', '.join(unreviewed)} have not passed Check. Record the "
-                "review first — `hermes kanban request-review <id> --summary \"what was "
-                "built + what was verified\"` — then close."
-            ),
+            "message": prompt_text("close_check", cards=", ".join(unreviewed)),
         }
 
     if inline:
@@ -464,11 +528,7 @@ def gate(
         return None
     return {
         "action": "block",
-        "message": (
-            f"manu: card(s) {', '.join(missing)} have no evidence. Attach the command "
-            "output or the artifact (`hermes kanban attach <id> <file>`), or pass "
-            '`--result "..."`, then close.'
-        ),
+        "message": prompt_text("close_evidence", cards=", ".join(missing)),
     }
 
 
@@ -531,41 +591,7 @@ _ARTIFACT_CAP, _ARTIFACT_EACH = 48000, 16000
 #: (below) and why the prompt asks for bounded lengths.
 _REVIEW_MAX_TOKENS = 8000
 
-_REVIEW_SYSTEM = """You are the independent Check on a Hermes kanban card (phases: Plan / Do / Check / Close).
-You did not do this work. You cannot see the author's conversation, its plan, its reasoning or its claims:
-your context is this prompt, the card text and the artifact content below, and nothing else.
-Judge the work against the card's acceptance criteria, and nothing else.
 
-Output one JSON object and nothing else:
-
-  {"criteria": [{"criterion": "<acceptance criterion, quoted short>",
-                 "verdict": "met|not_met|partial",
-                 "evidence": "<the file/line/output that shows it, or what is missing>"}],
-   "unverifiable": ["<what you cannot check from the material given>"],
-   "verdict": "pass|fail|partial",
-   "summary": "<two lines, plain, no praise>"}
-
-Rules:
-  - One entry per acceptance criterion on the card, in card order. A card with no
-    acceptance criteria gets an empty list and says so in summary.
-  - Quote each criterion in <= 25 words and each evidence field in <= 30 words: a
-    report that is cut off mid-sentence cannot be read as a verdict.
-  - "pass" requires every criterion "met" AND an empty unverifiable list.
-    Anything else is "partial" or "fail" — never round up.
-  - Never invent evidence you were not given. A missing artifact is unverifiable,
-    and a claim in the card body is not evidence of itself.
-  - No preamble, no code fences, no closing remarks.
-"""
-
-_REVIEW_USER = """Card {task_id} — {title}
-Status: {status}
-
-Card body (carries the acceptance criteria):
-{body}
-
-Artifacts:
-{artifacts}
-"""
 
 
 def _artifact_block(label: str, path: str, budget: int) -> Tuple[str, int]:
@@ -659,7 +685,8 @@ def _call_review_llm(task_id: str, user: str, timeout: int = 180) -> Any:
     try:
         return call_llm(
             task="review",
-            messages=[{"role": "system", "content": _REVIEW_SYSTEM}, {"role": "user", "content": user}],
+            messages=[{"role": "system", "content": prompt_text("review_system")},
+                      {"role": "user", "content": user}],
             temperature=0,
             max_tokens=_REVIEW_MAX_TOKENS,
             timeout=timeout,
@@ -707,7 +734,8 @@ def review(
                     "error": f"card is {task.status!r}: Check runs on a claimed card (`running`)",
                 }
             attachments = kb.list_attachments(conn, task_id)
-            user = _REVIEW_USER.format(
+            user = prompt_text(
+                "review_user",
                 task_id=task.id,
                 title=task.title or "(untitled)",
                 status=task.status,

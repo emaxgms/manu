@@ -147,6 +147,52 @@ def test_classifier_regressions_from_the_labelled_corpus():
     assert manu.looks_like_work("Io pulirei anche le skill inutili, brainstorming sembra interessante pero'")
 
 
+def test_classifier_reads_english_requests():
+    """The English class the corpus could not see (2026-10-13).
+
+    The word lists were tuned on Italian traffic: bare English stems were missing
+    ("analysis" is not "analis", "install" is not "installa") and the English verbs
+    that *were* in the ask list are the same word in a wh-question. A real request
+    — rank the OpenCode Go models — opened no card for exactly this reason.
+    """
+    for request in (
+        # reported case, verbatim: no card was opened for it
+        "Make an analysis trying to order the models provided in Opencode go subscription "
+        "https://opencode.ai/v2/docs/console/go/\n\nYou have to find benchmarks, other data, "
+        "community data, to reorder this table in order of most capable to least capable.",
+        "Make an analysis of the pricing table and reorder it",
+        "Install the grill-me skill and wire it into manu",
+        "Install this plugin on the Pi",
+        "Verify the evidence attached to the card",
+        "Please verify the sha256 of the artifact",
+        "Remove the stale entry from memory",
+        "Delete the archived cards",
+        "Translate the README into Italian",
+        # a question is still an ask when it carries a request opener
+        "Can you check the logs from last night?",
+        "Could you verify whether the card passed review?",
+    ):
+        assert manu.looks_like_work(request), request
+
+
+def test_classifier_ignores_a_wh_question_about_work():
+    """A question *about* the work is not the work: the same verbs must not fire.
+
+    These flipped to true as soon as `create`/`write`/`review` sat in the ask list,
+    which is why the ask list holds imperative forms only.
+    """
+    for question in (
+        "Why did no card get created for that request?",
+        "How does the gate decide to refuse a write?",
+        "What is the best coding model right now?",
+        "Which model has the best price per token?",
+        "Is the manu plugin enabled?",
+        "ho ricontrollato a mano i nostri file User.md e memory.md, non hanno le informazioni "
+        "che ti semplificherebbero la vita... come li riscriveresti?",
+    ):
+        assert not manu.looks_like_work(question), question
+
+
 def test_entry_never_opens_a_card_for_a_long_rant(tmp_path):
     """End to end: the length heuristic is gone, so a 700-char complaint stays silent."""
     db = _fake_db(tmp_path, session="other")
@@ -541,3 +587,57 @@ def test_phase_map_covers_every_open_status():
     assert set(manu.PHASE) == set(manu.OPEN)
     assert manu.PHASE["running"] == "Do" and manu.PHASE["review"] == "Check"
     assert set(manu.PLAN) < set(manu.OPEN) and "running" not in manu.PLAN
+
+
+# --- prompt texts live in prompts/*.md ------------------------------------
+
+_PROMPT_NAMES = (
+    "entry_plan", "recite", "plan_lock", "close_check", "close_evidence",
+    "review_system", "review_user",
+)
+
+
+def test_every_prompt_manu_asks_for_exists_on_disk():
+    for name in _PROMPT_NAMES:
+        f = manu._PROMPT_DIR / f"{name}.md"
+        assert f.is_file(), f
+        assert manu.prompt_text(name).strip(), name
+
+
+def test_prompt_renders_known_placeholders():
+    line = manu.prompt_text("recite", task_id="t_1", title="T", phase="Do", skill_hint="S.")
+    assert "#t_1" in line and '"T"' in line and "Do" in line and "S." in line
+    assert "{" not in line, line
+
+
+def test_prompt_keeps_unknown_placeholders_literal():
+    partial = manu.prompt_text("recite", task_id="t_1")
+    assert "#t_1" in partial and "{title}" in partial, partial
+
+
+def test_prompt_with_code_braces_is_not_formatted():
+    # review_system.md carries a literal JSON example: its braces must survive.
+    body = manu.prompt_text("review_system")
+    assert '{"criteria"' in body, body
+
+
+def test_missing_prompt_degrades_instead_of_raising(tmp_path, monkeypatch):
+    monkeypatch.setattr(manu, "_PROMPT_DIR", tmp_path / "gone")
+    assert manu.prompt_text("close_evidence").startswith("manu: refused")
+    assert manu.prompt_text("plan_lock").startswith("manu: refused")
+    assert manu.prompt_text("recite") == ""      # a hook goes quiet, no crash
+    assert manu.prompt_text("entry_plan") == ""
+
+
+def test_recite_names_the_phase_skills(tmp_path):
+    db = _fake_db(tmp_path)
+    assert "test-driven-development" in manu.recite("s1", db=db)
+    quiet = _fake_db(tmp_path / "quiet", status="blocked")
+    assert "Skills:" not in manu.recite("s1", db=quiet)
+
+
+def test_plugin_source_holds_no_copy_of_the_prompt_text():
+    src = _PLUGIN.read_text(encoding="utf-8")
+    for literal in ("Acceptance criteria first", "have not passed Check",
+                    "You are the independent Check"):
+        assert literal not in src, literal

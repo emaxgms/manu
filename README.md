@@ -185,7 +185,10 @@ to triage. manu adds only the gates that were missing, through the documented pl
 ~/.hermes/plugins/manu/
 ├── plugin.yaml          # manifest: 2 tools, 2 hooks
 ├── __init__.py          # the whole plugin
-├── test_manu.py         # 39 tests: entry classifier, Plan lock, Check, evidence, recitation, review
+├── prompts/             # every injected/sent prompt text, read at call time (no restart to edit)
+│   └── *.md             #   entry_plan, recite, plan_lock, close_check, close_evidence,
+│                        #   review_system, review_user
+├── test_manu.py         # 47 tests: classifier, Plan lock, Check, evidence, recitation, prompts
 ├── docs/
 │   └── entry-classifier.md   # how the keyword classifier was measured (and what still fools it)
 └── skill/
@@ -203,9 +206,13 @@ to triage. manu adds only the gates that were missing, through the documented pl
 |---|---|---|---|---|---|
 | v0.2.0 (word list + "longer than 200 chars") | 27 | 6 | 10 | 2 | 73.3% |
 | v0.3.0 | 29 | 14 | 2 | 0 | **95.6%** |
+| v0.4.1 (English requests and wh-questions added) | 29 | 14 | 2 | 0 | **95.6%** |
 
 Length is not work (eight of the ten false positives were long complaints), a work verb inside a question
-sentence is not an instruction, and `preview` is not `review`. The method, the numbers and the two
+sentence is not an instruction unless the question is the ask (`Can you check …?` counts, `How does the
+gate check a write?` does not), and `preview` is not `review`. The corpus is Italian, so the English class
+ships as two committed test sets instead: nine of eleven English requests used to open no card at all
+(`analysis` is not `analis`, `install` is not `installa`). The method, the numbers and the two
 remaining false-positive classes are in [`docs/entry-classifier.md`](docs/entry-classifier.md).
 
 ## What it deliberately does not do

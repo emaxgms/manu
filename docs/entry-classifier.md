@@ -23,12 +23,18 @@ labelled by the agent and kept as
 `~/.hermes/plans/manu-classifier-corpus.json` with the full table in
 `~/.hermes/plans/manu-classifier-measurement.md`.
 
+4. The corpus holds **no English requests**, so the second set is synthetic and small: 11 English
+   requests and 5 English wh-questions, written from the failure that started the v0.4.1 work, and
+   committed as `test_classifier_reads_english_requests` / `test_classifier_ignores_a_wh_question_about_work`
+   in `test_manu.py` — they are the regression set for that class, and they need no corpus to re-run.
+
 ## Result
 
-| classifier | TP | TN | FP | FN | accuracy |
-|---|---|---|---|---|---|
-| v0.2.0 (word list + 200-char rule) | 27 | 6 | **10** | 2 | 73.3% |
-| v0.3.0 (this revision) | 29 | 14 | **2** | 0 | **95.6%** |
+| classifier | TP | TN | FP | FN | accuracy | English set |
+|---|---|---|---|---|---|---|
+| v0.2.0 (word list + 200-char rule) | 27 | 6 | **10** | 2 | 73.3% | — |
+| v0.3.0 (measured, Italian corpus) | 29 | 14 | **2** | 0 | **95.6%** | 2/11 asks, 2/5 wh-questions |
+| v0.4.1 (Italian corpus unchanged + English stems) | 29 | 14 | **2** | 0 | **95.6%** | **11/11 asks, 5/5 wh-questions** |
 
 ## What the numbers said
 
@@ -48,6 +54,31 @@ labelled by the agent and kept as
 - **Missing change verbs were the two false negatives.** `"Voglio modificare una parte del processo"` and
   `"Io pulirei anche le skill inutili"` opened nothing. `modific`, `togli`, `rimuov`, `elimina`,
   `cancella`, `pulir`, `pulisc`, `miglior`, `fix`, `salva`, `check`, `verifica` were added.
+
+## The English gap (v0.4.1)
+
+The 45-case corpus is Italian, so **every English request was invisible to the measurement** — and a real
+one paid for it: *"Make an analysis trying to order the models provided in Opencode go subscription …"*
+(2026-10-13, 12:18) opened no card, so no Plan, no gate, no Check, and the work shipped unreviewed.
+
+- **Nine of eleven English requests got no card.** Stems are prefixes, and the Italian prefix is not the
+  English one: `analis`≠`analysis`, `installa`≠`install`, `verifica`≠`verify`, `rimuov`≠`remove`,
+  `elimina`/`cancella`≠`delete`, `traduci`≠`translate`. Added: `analys`, `analyz`, `install`, `verif`,
+  `remov`, `delet`, `translat` (the longer form replaces the shorter one: `verif` matches *verifica* and
+  *verify*).
+- **Fixing that alone created the opposite failure.** Two English wh-questions — *"how does the gate decide
+  to refuse a write?"*, *"why did no card get created for that request?"* — opened cards, because the ask
+  list held the bare English verbs `create`, `write`, `review`, `report`, `compare`, `audit`, `update`,
+  `add `, `analyze`, `debug`, `fix`, `summarize`, `explain`. In Italian those entries were imperatives
+  (`crea`, `scrivi`, `migliora`); in English the imperative, the infinitive and the participle are the same
+  word. The ask list now holds **imperative forms only** (and `crea ` with its trailing space, so *created*
+  is not *crea*).
+- **A question that is an ask still counts.** `REQUEST_OPENERS` (`puoi`, `potresti`, `possiamo`, `mi fai`,
+  `per favore`, `please`, `can you`, `could you`, `would you`, `will you`) marks the sentence as an
+  instruction, so its work stems count — *"Can you check the logs?"* opens a card, *"How does the gate
+  check a write?"* does not.
+- **The Italian corpus did not move:** 29/14/2/0, 95.6%, same two false-positive classes. The fix is
+  verified on both sets before it ships, which is the whole point of keeping the corpus around.
 
 ## The remaining two false positives — the ceiling
 

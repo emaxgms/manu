@@ -26,7 +26,7 @@ handoff, PR CI contracts, retry budget, escalation) is core Hermes, reused untou
 | Gate | Where | Effect |
 |---|---|---|
 | **Entry** | `pre_llm_call` | a work-shaped message with no card open for this session gets a `triage` card **created by the plugin** (bound to the session, body = your message) + one `[manu]` line telling the model to write the criteria, claim, and build. A quick question gets **nothing** — no card, no text |
-| **Recitation** | `pre_llm_call` | one line per turn while a card is open for this session (or unbound on the board); silent otherwise |
+| **Recitation** | `pre_llm_call` | one line per turn while a card is open for this session (or unbound on the board); silent otherwise. The line names the phase's skills (`PHASE_SKILLS` → `prompts/recite.md`) |
 | **Plan lock** | `pre_tool_call` on `write_file` / `patch` | refused while this session's card is still in `triage`/`todo`/`ready`: criteria first, then `claim` |
 | **Check** | `pre_tool_call` on `kanban complete` (tool **and** CLI) | refused unless the card's latest review event is a `review_requested` — a `changes_requested`/`review_reopened` after it re-opens the loop |
 | **Close** | `pre_tool_call` on `kanban complete` (tool **and** CLI) | refused with no attachment and no `--result` |
@@ -54,8 +54,11 @@ handoff, PR CI contracts, retry budget, escalation) is core Hermes, reused untou
   is missing and reach for the CLI on the Plan step, which has no turn context and 400s (bullet above).
 - **Ceilings, stated:** the classifier is a word list, not a model call — a work-shaped request it misses
   gets no card, and a quick question it over-reads leaves one orphan `triage` card to archive. It was
-  measured on 45 real requests in 2026-10: 10 false positives → 2, 2 false negatives → 0 (`docs/entry-classifier.md`
-  in the repo). Add a
+  measured on 45 real requests in 2026-10: 10 false positives → 2, 2 false negatives → 0, and on a
+  committed English set added in v0.4.1 (11 requests, 5 wh-questions) after an English request
+  ("Make an analysis …") opened no card — see `docs/entry-classifier.md` in the repo. The lists are
+  imperative forms plus prefix stems: adding a bare English verb to the ask list makes every wh-question
+  containing it a card. Add a
   marker to `_INTERNAL_MARKERS` whenever a new gateway-generated message class appears: delegation batch
   completions and `[INTERNAL NOTIFICATION …]` notices arrive in the **user** role but are not user
   requests, and without a marker the entry gate opens a card nobody asked for. All three
@@ -322,6 +325,11 @@ Closing is a three-step order, not a suggestion: Check first (`request-review`),
   **real** `auxiliary.review` call through `manu_review`, and asserts the verdict landed as the card's
   `review_requested` summary. Costs one small completion; no live writes. Run it from a real shell (a
   tool wrapper that re-executes the file can kill the run mid-call).
+- `prompts/` — every text manu injects or sends to a model, one file per text: `entry_plan.md`,
+  `recite.md`, `plan_lock.md`, `close_check.md`, `close_evidence.md`, `review_system.md`,
+  `review_user.md`. Read at call time, so **wording changes need no host restart**; a `.py` change
+  still does. A missing or unparseable file degrades (the hook goes quiet, a gate still refuses) and
+  never raises into the turn. An unknown `{placeholder}` is left literal.
 - `docs/entry-classifier.md` (repo root) — the labelled-corpus measurement behind the entry classifier:
   method, before/after numbers (FP 10 → 2, FN 2 → 0 on 45 real requests), and the two false-positive
   classes that remain.
@@ -364,3 +372,32 @@ cannot execute anything, shares the author's *model* (by default), and a summary
 the gate just as well as a recorded verdict does. The four-phase board is likewise reduced in practice:
 with no second reader, Evaluate and Rework happen inside the same turn; the gates guarantee that a Check
 *happened*, not that it was rigorous.
+
+**v0.4.0 (2026-10-13) — phase skills, and prompt text moved out of the code.**
+- `PHASE_SKILLS` names the skill(s) of the current phase in the injected lines: `grill-me` while the
+  card is in Plan, `test-driven-development` + `ad-hoc-verification` in Do, `requesting-code-review` in
+  Check, nothing in `blocked`. A phase that names none injects no skill text.
+- **A name is a reminder, not a load.** The model still has to load the skill; only a
+  dispatcher-spawned worker is force-loaded, from the card's own `tasks.skills` column via `--skills`.
+  With dispatch off (this machine) the field is inert, which is why the plugin does not write it —
+  a card is claimed in Do, so a skill written at creation would be the wrong phase's.
+- Every prompt text moved to `prompts/*.md`, read at call time (`prompt_text()`): editing wording is
+  now a file edit with no host restart. 47 tests (8 new: file presence, rendering, literal braces in
+  the JSON example, missing-file degradation, phase skills in the recitation, and a guard that the
+  source holds no copy of the text).
+
+**v0.4.1 (2026-10-13) — the entry classifier reads English.** An English request ("Make an analysis trying
+to order the models provided in Opencode go subscription …", the OpenCode Go ranking) opened **no card**:
+no Plan, no gate, no Check. Stems are prefixes and the Italian prefix is not the English one — `analis`
+never matches *analysis*, nor `installa` *install*, `verifica` *verify*, `rimuov` *remove*, `traduci`
+*translate*. Nine of eleven English requests were silent.
+- `analys`, `analyz`, `install`, `verif`, `remov`, `delet`, `translat` added to the work list.
+- The ask list now holds **imperative forms only**: the bare English verbs it carried (`create`, `write`,
+  `review`, `report`, `compare`, `audit`, `update`, `add `, `analyze`, `debug`, `fix`, `summarize`,
+  `explain`) are the same word in a wh-question, and adding English stems on top of them made *"why did no
+  card get created for that request?"* open a card. `crea` became `crea ` for the same reason (*created*
+  is not *crea*).
+- `REQUEST_OPENERS` (`puoi`, `potresti`, `possiamo`, `mi fai`, `per favore`, `please`, `can you`,
+  `could you`, `would you`, `will you`): a question carrying one of them is an ask, so its work stems
+  count — *"Can you check the logs?"* opens a card, *"How does the gate decide to refuse a write?"* does
+  not. Italian corpus unmoved: 29/14/2/0, 95.6%. 49 tests, **gateway restart required** for the hook code.
