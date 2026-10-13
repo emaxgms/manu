@@ -182,6 +182,11 @@ _COMPLETE_CMD = re.compile(
     r"(?:^|[;&|]\s*)(?:\S*/)?hermes(?:\s+[-\w=.:/@]+)*\s+kanban\s+complete\b(?P<rest>[^;&|]*)"
 )
 
+#: What a task id looks like: `t_ab80c5a4`, or a bare number on an older board.
+#: Anything else a command line leaves in the segment (a redirect leftover, a
+#: word from an unquoted value) is not an id and must not reach the gate.
+_ID_SHAPE = re.compile(r"t_[0-9a-f]+|\d+")
+
 #: Idempotency-key prefix for cards this plugin opens itself.
 _KEY_PREFIX = "manu:"
 
@@ -438,7 +443,12 @@ def _ids_from_command(command: str) -> Tuple[list, bool]:
     whether an inline ``--result``/``--summary``/``--metadata`` was supplied.
 
     shlex handles the quoting; flag *values* are skipped so a summary string
-    containing digits is never mistaken for a task id.
+    containing digits is never mistaken for a task id. Two shapes of garbage
+    survive shlex on a real command line and must not become phantom ids: the
+    words of a value whose quoting was lost in transit (``--result manu v0.4.1
+    shipped``), and redirection leftovers (``2>`` from ``2>&1 | tail``). The
+    first is why a value flag swallows every following non-flag token, the
+    second is why an id has to look like one.
     """
     value_flags = ("--result", "--summary", "--metadata")
     ids: list = []
@@ -453,7 +463,9 @@ def _ids_from_command(command: str) -> Tuple[list, bool]:
             token = tokens[i]
             if token in value_flags:
                 inline = True
-                i += 2
+                i += 1
+                while i < len(tokens) and not tokens[i].startswith("-"):
+                    i += 1
                 continue
             if token.split("=")[0] in value_flags:
                 inline = True
@@ -462,7 +474,7 @@ def _ids_from_command(command: str) -> Tuple[list, bool]:
             if not token.startswith("-"):
                 for part in token.split(","):
                     part = part.strip(".;:!?'\"()[]")
-                    if part:
+                    if _ID_SHAPE.fullmatch(part):
                         ids.append(part)
             i += 1
     return ids, inline

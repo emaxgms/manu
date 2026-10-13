@@ -385,6 +385,29 @@ def test_gate_ignores_punctuation_around_ids():
     assert ids == ["3", "4"] and inline is True, (ids, inline)
 
 
+def test_gate_does_not_turn_a_result_string_into_phantom_ids():
+    """Observed on 2026-10-13: the close was refused with the *words* of the
+    result string reported as cards whose Check was missing.
+
+    The value of `--result` was unquoted by the time the gate saw the command, so
+    one token became `--result manu v0.4.1 shipped …` and the old `i += 2` skipped
+    only its first word; every other word was read as a task id. Same for the
+    `2>` left by `2>&1 | tail`, which is a redirect, not a card.
+    """
+    ids, inline = manu._ids_from_command(
+        "cd ~ && hermes kanban attach t_286bb29e f.md 2>&1 | tail -1; "
+        "hermes kanban complete t_286bb29e --result manu v0.4.1 shipped and pushed 2>&1 | tail -2"
+    )
+    assert ids == ["t_286bb29e"], ids
+    assert inline is True
+    ids, inline = manu._ids_from_command(
+        'hermes kanban complete t_286bb29e --result "manu v0.4.1, shipped" 2>&1 | tail -2'
+    )
+    assert ids == ["t_286bb29e"] and inline is True, (ids, inline)
+    # ...and the pre-existing behaviour still holds
+    assert manu._ids_from_command("hermes kanban complete t_a, t_b --result x")[0] == ["t_a", "t_b"]
+
+
 def test_evidence_reads_real_db(tmp_path):
     assert manu._evidence("1", db=_fake_db(tmp_path / "a")) is False
     assert manu._evidence("1", db=_fake_db(tmp_path / "b", attachments=1)) is True

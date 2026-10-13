@@ -401,3 +401,10 @@ never matches *analysis*, nor `installa` *install*, `verifica` *verify*, `rimuov
   `could you`, `would you`, `will you`): a question carrying one of them is an ask, so its work stems
   count — *"Can you check the logs?"* opens a card, *"How does the gate decide to refuse a write?"* does
   not. Italian corpus unmoved: 29/14/2/0, 95.6%. 49 tests, **gateway restart required** for the hook code.
+
+**v0.4.2 (2026-10-13) — the close gate stops inventing cards.** Closing a card was refused with the *words*
+of the `--result` string listed as cards that had not passed Check: the value arrives unquoted (quoting is
+lost in transit), so the old `i += 2` skipped only its first word and every other word was read as a task
+id. A `2>&1 | tail` suffix had the same effect through the `2>` redirect leftover. The value flags now
+swallow every following non-flag token, and an id has to match `_ID_SHAPE` (`t_ab80c5a4`, or a bare number)
+before it reaches the gate. 50 tests (1 new, with the exact failing command line).
