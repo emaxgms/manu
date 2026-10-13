@@ -29,8 +29,11 @@ Rules for an agent (human or model) working in this repository. They describe th
 - **There is no CI service on this repository — the gate is the local suite.** Before any push:
 
   ```bash
-  ~/.hermes/hermes-agent/venv/bin/python -m pytest test_manu.py -q   # currently 49 tests
+  ~/.hermes/hermes-agent/venv/bin/python -m pytest -q   # currently 49 tests
   ```
+
+  `pytest.ini` pins `testpaths = .`, so a bare `pytest` at the repo root is the same gate (and the
+  workspace tooling can detect the command instead of reporting the change as unverified).
 
   It must be green in a plain shell *and* inside a delegated child (the suite clears
   `HERMES_KANBAN_TASK` / `HERMES_CRON_SESSION` / `HERMES_DELEGATED_CHILD_CONTEXT` itself).
