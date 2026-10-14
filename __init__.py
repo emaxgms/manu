@@ -517,6 +517,14 @@ def gate(
         task_ids = args.get("task_ids") or ([args["task_id"]] if args.get("task_id") else [])
         ids = [str(t) for t in task_ids]
         inline = bool(args.get("result") or args.get("summary") or args.get("metadata"))
+        if not ids:
+            # A dispatched worker calls this without a task id: the tool defaults
+            # it from HERMES_KANBAN_TASK. Read the same source, or the Check/Close
+            # refusals silently no-op for every worker (verified live 2026-10-13:
+            # a probe worker closed an unreviewed card).
+            env_task = os.environ.get("HERMES_KANBAN_TASK")
+            if env_task:
+                ids = [env_task]
     elif tool_name == "terminal":
         command = args.get("command") or ""
         if isinstance(command, str) and "kanban complete" in command:

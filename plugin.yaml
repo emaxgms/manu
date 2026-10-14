@@ -1,5 +1,5 @@
 name: manu
-version: 0.4.2
+version: 0.5.0
 description: >-
   Process layer (Plan / Do / Check / Close) over the Hermes kanban board, with a
   rework loop back to Plan. The skill holds the process content; this plugin

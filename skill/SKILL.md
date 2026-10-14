@@ -170,6 +170,28 @@ delegate_task(
   ("reassigns the task before review dispatch"), which means nothing with the dispatcher off — there is no
   review run to hand to anyone.
 
+## Handoff mode — plan in the chat, execute in the dispatcher
+
+With `kanban.dispatch_in_gateway: true`, Plan can end in a handoff: the session writes the
+criteria and **leaves the card in `ready`** instead of claiming it. A dispatcher tick
+(≤30 s) claims it and spawns the worker (`hermes -p <profile> chat -q "work kanban task
+<id>"`, workspace-pinned, `KANBAN_GUIDANCE` injected); the worker takes Do → Check itself
+with `kanban_request_review`, and the dispatcher spawns the reviewer (`sdlc-review`) as a
+second fresh process. The session never claims and never builds.
+
+- Interview while the card is `triage` — the dispatcher claims only `ready`/`review`, so
+  asking questions has no race with it.
+- Strict no-race handoff (specify → claim is ≤ one dispatch tick away): `hermes kanban
+  block <id>` → edit the body → `hermes kanban unblock <id>`; blocked cards are not
+  claimable, and unblock returns the card to `ready`.
+- Since v0.5.0 the gates follow the handoff into the workers: `gate()` resolves a
+  `kanban_complete`'s id from `HERMES_KANBAN_TASK` when the args carry none, so a
+  dispatched implementer must record a review before closing (the reviewer's own approval
+  passes — `review_requested` is the last review event).
+- A worker that needs the user blocks `needs_input` and waits; the session answers in
+  chat, comments, and `unblock`s — the dispatcher respawns the implementer with the full
+  card. `hermes kanban diagnostics` flags dispatcher-held cards (`stranded_in_ready`).
+
 ## Failure triage — classify before retrying
 
 - `transient` (red test, crash, flaky tool, empty output) → **automatic retry**, budget above, zero
@@ -408,3 +430,13 @@ lost in transit), so the old `i += 2` skipped only its first word and every othe
 id. A `2>&1 | tail` suffix had the same effect through the `2>` redirect leftover. The value flags now
 swallow every following non-flag token, and an id has to match `_ID_SHAPE` (`t_ab80c5a4`, or a bare number)
 before it reaches the gate. 50 tests (1 new, with the exact failing command line).
+
+**v0.5.0 (2026-10-13) — handoff mode (plan in the chat, execute in the dispatcher).**
+The entry and Plan-lock prompts now name the handoff: criteria first, then either claim
+and build in-session or leave the card `ready` — the dispatcher executes it. The
+Check/Close gates bind **dispatched workers**: `gate()` falls back to
+`HERMES_KANBAN_TASK` when a `kanban_complete` carries no task id, which is exactly how a
+worker calls it — verified live on a throwaway board (without the fallback a probe worker
+closed an unreviewed card; with it the refusal fires, and the reviewer's own approval
+still passes). `close_check.md` names the `kanban_request_review` tool for workers; the
+CLI form stays for shells. 51 tests.

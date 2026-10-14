@@ -408,6 +408,30 @@ def test_gate_does_not_turn_a_result_string_into_phantom_ids():
     assert manu._ids_from_command("hermes kanban complete t_a, t_b --result x")[0] == ["t_a", "t_b"]
 
 
+# --- dispatched workers (v0.5.0): the gates bind via HERMES_KANBAN_TASK -----
+
+
+def test_gate_binds_worker_completes_via_env(monkeypatch):
+    """Observed 2026-10-13 (probe B): a dispatched worker's `kanban_complete`
+    carries no task id — it defaults from HERMES_KANBAN_TASK — so the gate read
+    no ids and the Check/Close refusals never fired: the worker closed an
+    unreviewed card. The env fallback is what makes the gates hold in workers."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_w0rk")
+    reason = manu.gate("kanban_complete", {"summary": "done"},
+                       _reviewed_lookup=lambda t: False)
+    assert reason and "not passed Check" in reason["message"], reason
+    reason = manu.gate("kanban_complete", {}, _reviewed_lookup=lambda t: True,
+                       _lookup=lambda tid: False)
+    assert reason and "no evidence" in reason["message"], reason
+    # the reviewer's own approval passes (reviewed), explicit ids still win over
+    # the env, and outside a worker the hook stays silent exactly as before
+    assert manu.gate("kanban_complete", {"task_ids": ["1"]},
+                     _reviewed_lookup=lambda t: True, _lookup=lambda t: True) is None
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    assert manu.gate("kanban_complete", {"summary": "x"},
+                     _reviewed_lookup=lambda t: False) is None
+
+
 def test_evidence_reads_real_db(tmp_path):
     assert manu._evidence("1", db=_fake_db(tmp_path / "a")) is False
     assert manu._evidence("1", db=_fake_db(tmp_path / "b", attachments=1)) is True
