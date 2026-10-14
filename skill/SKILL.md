@@ -64,6 +64,12 @@ handoff, PR CI contracts, retry budget, escalation) is core Hermes, reused untou
   requests, and without a marker the entry gate opens a card nobody asked for. All three
   gates are *presence* checks: criteria quality and evidence quality stay the reviewer's job. A human
   running `hermes kanban complete` from their own shell bypasses them on purpose.
+- **The phase's skills are named in the injected line, not loaded by it.** `PHASE_SKILLS` (Plan →
+  `grill-me`, Do → `test-driven-development` + `ad-hoc-verification`, Check → `requesting-code-review`,
+  `blocked` → none) is a reminder the model still has to act on with `skill_view`. Only a
+  dispatcher-spawned worker is force-loaded, from the card's own `tasks.skills` column via `--skills`; with
+  dispatch off that column is inert, so do **not** write it at creation — a card is claimed in Do, so a
+  skill written then belongs to the wrong phase.
 
 ## The four phases
 
@@ -118,8 +124,11 @@ unverifiable: whether the three names are real sources — no links given
 - The first line carries the per-criterion verdicts on purpose: core keeps only the first line (400 chars)
   of a `review_requested` summary in the event payload; the full evidence lines live on the run row
   (`hermes kanban runs <id>`).
-- Read the returned JSON and **act on a `partial`/`fail`**: fix the artifact, then run `manu_review` again
-  (or `reopen-review` after the close if the card already moved). A recorded Check is not a passing Check.
+- Read the returned JSON and **act on a `partial`/`fail`**: fix the artifact, then run Check again. A
+  recorded Check is not a passing Check. Mid-Do the repeat is `hermes kanban reopen-review <id> --reason
+  "<what the Check found>"` → `claim` → `manu_review`: after a Check the card sits in `review`, where
+  `manu_review` refuses ("Check runs on a claimed card"). One rework round is normal; a third loop on the
+  same criterion means the criterion is not checkable from an artifact (see 15).
 - **An unreadable verdict is not recorded.** If the reply comes back truncated or not as a JSON object,
   the tool returns `success=false`, hands you the raw reply, and leaves the card in Do — the gate must not
   accept a Check nobody can read. (Live case: ten long criteria made the reviewer echo them past the token
@@ -228,6 +237,7 @@ hermes kanban request-review <id> --summary "what was built + what was verified"
 hermes kanban complete <id> --result "pytest -q -> 12 passed; report at /home/ema/report.md"
 hermes kanban attach <id> <file>         # evidence alternative to --result
 hermes kanban reopen-review <id> --reason "acceptance #2 not met: no latency numbers"   # rework, in-session
+hermes kanban comment <id> "the reason"   # positional text; there is NO --body flag
 hermes kanban request-changes <id> "acceptance #2 not met"   # reviewer-side; needs an active review run
 hermes kanban runs <id>                  # the full Check, evidence lines included
 hermes kanban show <id> ; hermes kanban stats
@@ -236,11 +246,17 @@ hermes kanban show <id> ; hermes kanban stats
 Closing is a three-step order, not a suggestion: Check first (`request-review`), then a close with
 `--result`/`--summary` or an attachment. Both are refused by the gate with the exact command to run.
 
+Evidence that holds up: a verification note under `~/.hermes/plans/` carrying the commands run and their
+real output, attached with `hermes kanban attach` and passed to `complete --result <path>` (space-free).
+The same file the Check read, so the record and the review agree.
+
 ## Common Pitfalls
 
 1. **Correcting a blocked write by writing somewhere else.** The Plan lock covers `write_file`/`patch`;
    `terminal`/`execute_code` are deliberately never gated. Routing a write through a heredoc is the
-   documented bypass — it is visible in the transcript, and it defeats the criteria.
+   documented bypass — it is visible in the transcript, and it defeats the criteria. The lock is on the
+   tool call, not the path — a scratch or probe file written with `write_file` before `claim` is refused
+   too, so do the reads first and let the first file write land in Do.
 2. **Asking mid-Do.** Questions belong in Plan (they shape the spec) or in Rework (the gap is concrete).
    Mid-Do the correct move is `hermes kanban block <id> --reason "..." --kind needs_input`.
 3. **Retrying an intent gap.** A green result that misses the requirement will stay green after N
@@ -256,9 +272,11 @@ Closing is a three-step order, not a suggestion: Check first (`request-review`),
    argv: every non-flag token it sees is treated as a card id. So
    `hermes kanban complete <id> --result "text with spaces" 2>&1` is refused with the bogus
    `card(s) <words> have not passed Check`, and the refusal kills the whole `&&`/`;` chain — a
-   `request-review` earlier in the same line never runs. Invoke the close as a **bare, single command**
-   with a space-free `--result` (an artifact path is ideal); put the narrative in the earlier
-   `request-review --summary` or in the attachment.
+   `request-review` earlier in the same line never runs. The value you type can also arrive with its quoting stripped: with the value
+   unquoted, every word after the flag is a candidate card id, so a multi-word `--result` is a parser
+   input, not a comment. With an attachment already on the card, close with the **bare id and nothing
+   else**; if you must pass a value, make it one word (a space-free artifact path is ideal). The
+   narrative belongs in the earlier `request-review --summary` or in the attachment.
 8. **Treating a committed plugin fix as live.** Plugin hook code loads once per process
    (`hermes_cli/plugins.py` `discover_and_load`: `if self._discovered and not force: return`), so
    a fix written after a host started keeps running the OLD module in that host until it restarts.
@@ -288,12 +306,39 @@ Closing is a three-step order, not a suggestion: Check first (`request-review`),
    `pytest`, open a URL, or read a file you did not inline (it will list those as `unverifiable`, which is
    the honest answer, not a failure). If a criterion requires executing something, run that yourself, attach
    the output as an artifact, and pass it to `manu_review` — or use the delegated child above.
+13. **Asserting a result instead of pasting it.** The reviewer sees only the text it is handed, so "X is
+   installed", "tests pass", "no system change was made" arrive as claims it must mark unverifiable — and a
+   Check has failed a card over exactly that. Paste the *output*: the `hermes skills list` line, the pytest
+   tail (`47 passed`, not "green"), the fresh-process probe line, the version from `plugins doctor`. An
+   unevidenced claim is the same failure mode as a review summary typed from memory.
+14. **Writing the evidence note in reading order instead of review order.** The reviewer inlines only the
+   first several KB of an artifact and drops the tail, so the proofs must precede the operational notes
+   ("not live yet", "after the restart"). Order it: what changed → commands run + their output →
+   per-criterion proof → the guards (test names, listings) → caveats last. A long file is not more
+   persuasive, it is truncated.
+15. **Criteria the aux reviewer can never mark `met`.** A criterion that constrains the *chat reply* ("the
+   report opens with a verdict") or proves an *absence* ("no system change was made") cannot be satisfied
+   from the card plus the artifacts, however much material you add: the verdict stays `partial`. Record
+   why in a card comment, let the reader verify it, close, and say so in the reply. Do not loop the Check
+   chasing a `pass`, and do not pad the artifact to game the gate. A third standing class is **evidence
+   that is a transcript**: on report/audit cards the artifact carries command output the session ran, and
+   the tool-less reviewer lists "cannot re-execute these" as `unverifiable` even while every criterion
+   comes back `met` — structural, record it, close, do not rework.
+16. **Letting a decision card inherit deliverable-shaped criteria.** The specifier writes "prototype one
+   skill end to end" or "build X" even when the card's job is to decide; executing that turns a decision
+   into a system change. Replace the criteria before claiming (`manu_specify` → `edit` → `claim`) with the
+   document deliverable plus an explicit "no system change" line — phrase it as a **presence** check
+   ("the report states explicitly that no system change was made"): a bare absence claim can never come
+   back `met` (15) — and state what was cut in Out of scope.
+
+17. **Duplicate sibling cards are not proof of repeated user input.** Entry is session-scoped, so repeated deliveries or one request opened across multiple surfaces can create one card per session and N identical runs. Before broad work, compare `hermes kanban list` titles/timestamps/statuses, `hermes kanban stats`, and `/fleet` or `~/scripts/hermes_live.py`; state the observed count and leave the cause unknown until confirmed, because transport retries and deliberate resends look alike. Choose one canonical report and name the siblings. Never archive, reassign, or complete an active sibling until its owner session has ended and the user wants it closed — `hermes kanban archive` stops that card's recitation and Plan lock. If duplicates reproduce after one intentional submission, track a dedupe-window change as a separate plugin task.
 
 ## Verification Checklist
 
 - [ ] The gates fired: entry opened the card, the Plan lock held the writes until `claim`, Check preceded Close
 - [ ] Acceptance criteria written on the card before the first build action
 - [ ] `hermes kanban stats` shows no card left in `running` when the work is done
+- [ ] No sibling card/session left unhandled for the same request (see 17)
 - [ ] After a plugin-code change: every plugin host restarted, and the new behaviour seen on a
       NEW session (not just in tests)
 - [ ] Any failed Check classified (`transient` / `needs_input` / `capability` / `dependency`) before acting
@@ -301,16 +346,26 @@ Closing is a three-step order, not a suggestion: Check first (`request-review`),
       not just a `review_requested` event the gate happens to accept
 - [ ] Card closed with evidence attached or in `--result`, after `review`
 
-## Reporting a design proposal to this user
+## Reporting to this user
 
-- Verdict in one line, then the mechanism (which hook, which CLI command, which file) — never a promise.
+The format is part of the deliverable: a report he cannot classify as good or bad has failed, however
+complete it is. Test it by asking "does he know, after one screen, what is good and what is not?"
+
+- **Verdict in one line, first.** Then the mechanism *in words* — which gate, which command, which file —
+  never a promise. Keep `file:line` references, constant names and command transcripts in the attached
+  document: in chat they read as noise. Say what a thing does, then name it — an unexplained term
+  (hook, force-load, session-scoped) reads as evasion.
+- **Label every item, and say the number: ✅ have it / do it · ⚠️ partial, with the gap named · ❌ not doing
+  it, with the reason.** A recommendation delivered as a flat list of facts is not a recommendation.
 - Name the honest ceiling and what is deferred, with the trigger that would revive it.
 - End with **one** decision he has to make, not a menu — unless he asked for a menu (bullet below).
   Push back in mechanism terms when an idea is wrong.
 - Review/decision cards ("fai un review su X / se e perché fare Y"): deliver a markdown review in
   `~/.hermes/plans/` (English) grounded in live-checked facts (the commands run and their outputs)
   plus the authoritative docs — current state, pros/cons, an explicit recommendation with decision
-  triggers; attach it to the card, and make **no** system changes unless the card asks.
+  triggers; attach it to the card, and make **no** system changes unless the card asks. A full-system
+  audit sweep (host, services, caches, stack probes) ships as the `audit-sweep` reference of the
+  `hermes-install-cleanup` skill — start from it instead of improvising the command battery.
 - Long design threads: **patch the plan file in place** (phase table, acceptance tests, affected skill
   bullets) instead of appending "UPDATE:" sections.
 - Research/landscape reports ("how do others do X", "what should we build"): every third-party claim
