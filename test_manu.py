@@ -221,6 +221,25 @@ def test_looks_like_work_ignores_gateway_generated_messages():
     assert not manu.looks_like_work(batch)
     assert not manu.looks_like_work(notice)
 
+    # Live false positive (2026-10-16): a terminal background=true completion
+    # notice arrived in the user role, classified as work, and opened a card
+    # nobody asked for. This is the exact text that did it.
+    background_done = (
+        "[IMPORTANT: Background process proc_8bd401711a2c completed normally (exit code 0).\n"
+        "Command: for i in $(seq 1 12); do st=$(hermes kanban show t_acdef994 2>&1 | awk '/^  status:/{print $2}'); "
+        'echo "poll $i: status=$st"; case "$st" in done|blocked|review|ready) break;; esac; sleep 45; done; '
+        'ps -eo pid,etime,args | grep "work kanban task t_acdef994" | grep -v grep || echo "reviewer process finished"\n'
+        "Output:\npoll 1: status=running\n...\npoll 12: status=running\n"
+        " 492633       10:49 /home/ema/.hermes/tools/python-3.14.7/bin/python3 -m hermes_cli.main -p default --cli "
+        "--accept-hooks --skills sdlc-review --toolsets browser,... chat -q work kanban task t_acdef994\n]"
+    )
+    background_failed = (
+        "[IMPORTANT: Background process proc_1a2b3c4d failed with exit code 1. "
+        "Command: node test/pricing.test.mjs\nOutput:\n  FAIL inverted stay — expected 0, got 1\n"
+    )
+    assert not manu.looks_like_work(background_done)
+    assert not manu.looks_like_work(background_failed)
+
 
 def test_entry_opens_a_card_before_the_first_action(tmp_path):
     db = _fake_db(tmp_path, session="other")  # nothing open for this session

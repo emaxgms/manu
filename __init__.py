@@ -173,7 +173,13 @@ _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+|\n+")
 #: request: delegation results and system notices. Without this the gate opens a
 #: card for a message nobody sent (observed 3x on 2026-10-12).
 #: ponytail: marker list; extend it if a new internal sender appears.
-_INTERNAL_MARKERS = ("[internal notification", "[async delegation batch complete")
+_INTERNAL_MARKERS = (
+    "[internal notification",
+    "[async delegation batch complete",
+    # terminal background=true completions arrive in the user role; observed
+    # live (2026-10-16) opening a triage card nobody asked for.
+    "[important: background process",
+)
 
 #: ``hermes [-p x] kanban complete <ids> ...`` as its own command segment.
 #: ponytail: a heredoc that merely *mentions* the command can trip this; the

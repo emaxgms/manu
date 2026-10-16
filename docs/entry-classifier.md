@@ -9,7 +9,8 @@ traffic and publish the numbers.
 1. Pull the most recent real user requests out of `~/.hermes/state.db`:
    `messages.role='user'`, sessions whose `source` is `telegram`/`tui`/`desktop`, excluding
    `Subagent:*` sessions and the gateway-generated classes (`[INTERNAL NOTIFICATION …]`,
-   `[ASYNC DELEGATION BATCH COMPLETE …]`, `[OUT-OF-BAND USER MESSAGE …]`, image/document wrappers,
+   `[ASYNC DELEGATION BATCH COMPLETE …]`, `[IMPORTANT: Background process …]`,
+   `[OUT-OF-BAND USER MESSAGE …]`, image/document wrappers,
    goal-mode continuations, and the plugin's own acceptance probes).
 2. Label each one **WORK** (the reply must produce or modify an artifact, or run an investigation with a
    reported conclusion) or **quick** (a question, a correction, a decision, feedback).
@@ -89,6 +90,16 @@ Both need semantics, not more words. `looks_like_work()` is a single function wi
 plugin, so replacing it with one auxiliary call (`auxiliary.<task>` route) is the upgrade path — the
 measurement above is the regression set any replacement has to beat. The labelled cases ship as
 `test_classifier_regressions_from_the_labelled_corpus` in `test_manu.py`, in anonymised form.
+
+## Internal-marker exclusions (v0.5.1)
+
+Machine notices are dropped by `_INTERNAL_MARKERS` before the word lists ever run. That list gained
+`[important: background process` after a **live false positive** (2026-10-16): a terminal
+`background=true` completion notice arrived in the user role, the classifier read the pasted command
+and output as work, and it opened a triage card nobody asked for (archived same session). No corpus
+number can move — no corpus message carries a marker, and the corpus method excludes these classes by
+construction — and the exact notice text is now a regression case in
+`test_looks_like_work_ignores_gateway_generated_messages`.
 
 ## Reproducing
 

@@ -495,3 +495,13 @@ worker calls it — verified live on a throwaway board (without the fallback a p
 closed an unreviewed card; with it the refusal fires, and the reviewer's own approval
 still passes). `close_check.md` names the `kanban_request_review` tool for workers; the
 CLI form stays for shells. 51 tests.
+
+**v0.5.1 (2026-10-16) — the entry gate stops reading background-process notices as work.**
+A terminal `background=true` / `notify_on_complete` completion arrives in the **user** role as
+`[IMPORTANT: Background process … completed normally (exit code 0).` followed by the whole command and
+its output. Live false positive: the classifier read it as a request and opened a triage card nobody
+asked for (archived same session; the mechanism was reproduced offline — the real text classifies as
+work with the markers cleared, and not as work with them). `[important: background process` added to
+`_INTERNAL_MARKERS`; the real notice text is a regression case in
+`test_looks_like_work_ignores_gateway_generated_messages`. 51 tests. **Host restart required** to load
+the marker list in the running hosts.
